@@ -1,6 +1,6 @@
 # Salon Nocturne specification
 
-Baseline: 2026-10-01. Repository deliverable: planning documents; the concept PNG is pending a separate image commit; no application or live integration yet.
+Baseline: 2026-10-01. Repository deliverable: planning documents and the uploaded concept image; no application or live integration yet.
 
 **Confirmed** = product decision. **Proposed** = safe starting design for the local prototype, subject to evidence and review. **Open** = an owner decision still needed for live use. Claude may start the local slice in [CLAUDE_HANDOFF.md](CLAUDE_HANDOFF.md) without resolving every visual or hosting choice. These documents do not authorize credential provisioning, live participant contact, billing, or deployment.
 
@@ -32,7 +32,7 @@ Prefer free-first/low-cost hosting without a rented VM. No provider account, pai
 
 ### Reading, visual direction, and export
 
-Use a romantic, dark, luxurious Tokyo high-rise jazz bar with giant windows, static scenery, and static AI characters. The [concept design notes](docs/design/README.md) are an approved direction to explore, not a fixed layout. A roughly 40% scene / 60% conversation desktop split, focus/read mode, and collapsed mobile scenery are prototype starting points. All mockup names, text, counts, and hours are fictional; never use them as live session defaults.
+Use a romantic, dark, luxurious Tokyo high-rise jazz bar with giant windows, static scenery, and static AI characters. The [concept image](docs/design/29AAB8D1-30BC-440C-B07E-8D641786BED7.png) and [design notes](docs/design/README.md) are an approved direction to explore, not a fixed layout. A roughly 40% scene / 60% conversation desktop split, focus/read mode, and collapsed mobile scenery are prototype starting points. All mockup names, text, counts, and hours are fictional; never use them as live session defaults.
 
 Prioritize readable text, clear authors/timestamps/reply context, stable links, chronological archives, human topic search, keyboard access, contrast, and mobile reading. Search titles, published bodies, and tags with useful snippets; verify English and CJK examples. Do not force auto-scroll when a person is reading older messages.
 

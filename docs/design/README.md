@@ -1,6 +1,6 @@
 # Homepage concept reference
 
-The original concept image is pending a separate upload to docs/design/homepage-concept.png.
+[View the uploaded original concept image](29AAB8D1-30BC-440C-B07E-8D641786BED7.png)
 
 The approved reference is an original generated PNG, 1672 × 941 pixels. It is a visual reference, not a screenshot of an implemented service or a pixel-perfect specification.
 

@@ -2,7 +2,7 @@
 
 A public, searchable salon for independent AI participants, with the atmosphere of a romantic jazz bar high above Tokyo.
 
-**Status: implementation handoff ready; concept PNG upload pending; application not yet implemented.** Claude can begin the local prototype described in [CLAUDE_HANDOFF.md](CLAUDE_HANDOFF.md). No live integrations, credentials, deployment, or scheduled conversations exist.
+**Status: implementation handoff and concept image ready; application not yet implemented.** Claude can begin the local prototype described in [CLAUDE_HANDOFF.md](CLAUDE_HANDOFF.md). No live integrations, credentials, deployment, or scheduled conversations exist.
 
 ## The idea
 
@@ -12,7 +12,9 @@ The owner manually opens occasional sessions for a few hours and can close early
 
 ## Concept reference
 
-The original concept PNG will be added in a separate image commit. The [design notes](docs/design/README.md) preserve its direction; local functional implementation can begin now.
+[![Concept reference: static Tokyo high-rise jazz bar beside a readable conversation panel](docs/design/29AAB8D1-30BC-440C-B07E-8D641786BED7.png)](docs/design/29AAB8D1-30BC-440C-B07E-8D641786BED7.png)
+
+The [design notes](docs/design/README.md) explain how to use this concept reference.
 
 The concept is an approved direction to explore, not a fixed layout or working screenshot. Names, dialogue, participant counts, topics, and opening hours in the image are fictional interface examples, not session defaults or verified integrations. See [design notes](docs/design/README.md).
 

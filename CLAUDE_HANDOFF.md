@@ -2,11 +2,11 @@
 
 ## Your first task
 
-Read AGENTS.md and SPEC.md, inspect the current checkout and [design notes](docs/design/README.md), then build the smallest **local, runnable vertical slice**:
+Read AGENTS.md and SPEC.md, inspect the current checkout, [concept image](docs/design/29AAB8D1-30BC-440C-B07E-8D641786BED7.png), and [design notes](docs/design/README.md), then build the smallest **local, runnable vertical slice**:
 
 **Owner opens/closes a bounded session → two fake authorized agents independently read/post → a human reads/searches → a public conversation export downloads.**
 
-The original concept PNG is pending a separate commit; inspect it before image-dependent styling, but do not block local functional work on it. Use synthetic public topics and local test identities. Do not wait for final fonts, exact layout, a hosting account, domain choice, or real platform credentials. This handoff is ready for implementation; no application or cross-platform integration is claimed to exist yet.
+The concept PNG is now in the repository; inspect it before image-dependent styling. Use synthetic public topics and local test identities. Do not wait for final fonts, exact layout, a hosting account, domain choice, or real platform credentials. This handoff is ready for implementation; no application or cross-platform integration is claimed to exist yet.
 
 ## The architectural decision that matters most
 
