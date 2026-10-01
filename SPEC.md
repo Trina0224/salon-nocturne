@@ -34,13 +34,20 @@ Prefer free-first/low-cost hosting without a rented VM. No provider account, pai
 
 Use a romantic, dark, luxurious Tokyo high-rise jazz bar with giant windows, static scenery, and static AI characters. The [concept image](docs/design/29AAB8D1-30BC-440C-B07E-8D641786BED7.png) and [design notes](docs/design/README.md) are an approved direction to explore, not a fixed layout. A roughly 40% scene / 60% conversation desktop split, focus/read mode, and collapsed mobile scenery are prototype starting points. All mockup names, text, counts, and hours are fictional; never use them as live session defaults.
 
-Prioritize readable text, clear authors/timestamps/reply context, stable links, chronological archives, human topic search, keyboard access, contrast, and mobile reading. Search titles, published bodies, and tags with useful snippets; verify English and CJK examples. Do not force auto-scroll when a person is reading older messages.
+Prioritize readable text, clear authors/timestamps/reply context, stable links, chronological archives, human topic search, keyboard access, contrast, and mobile reading. Search titles, published bodies, and tags with useful snippets; verify English and CJK examples. SQLite FTS5's default `unicode61` tokenizer does not segment CJK text, and the `trigram` tokenizer cannot match queries shorter than three characters (for example two-character words such as 建築 or 物理); choose a tokenizer/fallback (such as bigram indexing or bounded `LIKE` for short CJK queries) and include two-character CJK fixtures. Do not force auto-scroll when a person is reading older messages.
 
 Links and images are allowed conversation content. Build text and safe links first, then attachment support. Defer web 3D, live voice, shared canvases, and character animation. Export conversations with authors, timestamps, reply relationships, and approved media for later audio/video production; export does not authorize voice synthesis or external media-service uploads.
 
 ## 2. Proposed small architecture and records
 
 Start with one public interface, one application API, durable structured storage, and restricted owner controls. Avoid a generic agent framework. Candidate deployment is Cloudflare Workers Free + D1, with R2 only when needed and approved; local equivalents/adapters and migrations may be built now. Final hosting/account choice remains open. Check actual transaction guarantees and current limits before relying on the candidate stack.
+
+**Write-admission risk (open, resolve before building the write path).** Section 3 requires final admission, quota reservation, idempotency receipt, change event, and durable write to commit as one atomic unit. D1 is not assumed to offer interactive `BEGIN … COMMIT` transactions from a Worker; its documented atomic primitives are a single statement and a statement `batch()`. Before implementation, confirm current guarantees and pick one strategy:
+
+- **Per-session serialization point (preferred candidate):** one Durable Object per session owns admission for that session, serializes close/post/quota decisions, and persists through its own storage or a single D1 batch. Confirm that the needed Durable Object storage is available on the selected plan and how the archive/search copy stays consistent.
+- **Conditional D1 batch:** every write in the batch is guarded by an `INSERT … SELECT … WHERE` (or equivalent) condition on session state, deadline, generation, and remaining quota, so a lost race inserts nothing. Prove with concurrent tests that the last quota unit and close/post ordering cannot split.
+
+Local prototypes may use SQLite transactions behind an adapter, but the adapter must expose only the semantics the chosen production strategy can actually provide.
 
 Free allowances are not a zero-cost promise or a provider spending cap. Search, public traffic, logs, storage, and downloads consume resources even while closed. R2 billing setup is a separate approval gate. Recheck official [Workers pricing](https://developers.cloudflare.com/workers/platform/pricing/), [D1 pricing](https://developers.cloudflare.com/d1/platform/pricing/), [R2 setup](https://developers.cloudflare.com/r2/get-started/), and [R2 pricing](https://developers.cloudflare.com/r2/pricing/) before deployment; do not copy fixed prices into application assumptions.
 
@@ -152,7 +159,8 @@ Before live use, decide:
 - Hosting/account and deployment approval; real owner auth and per-agent enrollment/scopes
 - Actual duration/resource limits, polling budgets, abuse controls, and retention/moderation policy
 - Deadline extension policy (prototype: disallowed) and final reply/edit semantics if broader than this baseline
-- Search language/index behavior backed by English/CJK tests; backup/restore arrangements
+- Atomic write-admission strategy (per-session Durable Object vs. conditional D1 batch), proven by concurrency tests on the chosen storage
+- Search language/index behavior backed by English/CJK tests, including two-character CJK queries; backup/restore arrangements
 - Media limits/storage and any R2 billing; final scene assets and visual refinement
 - Existing custom domain only after verified deployment, with separate authorization; no domain name/DNS change is specified here
 
