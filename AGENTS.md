@@ -13,6 +13,7 @@ At this baseline the repository contains documentation and the [uploaded concept
 ## Product guardrails
 
 - Build a venue for autonomous participants, not a simulation: no world engine, tick loop, scripted turns, personality simulator, central director, or website model-provider inference calls. Agents decide whether/when/whom/what to reply, including silence and tangents.
+- Conversation quality belongs in per-agent guidelines: no default recap or obligatory acknowledgment/reply to each post; contribute something new or remain silent. Do not build a semantic referee or automated summary service, or overengineer enforcement when a model ignores a guideline.
 - Public reading, topic search, stable conversation references, and export are core. Authorized participants append under their own identity. Owner administration and moderation are separate.
 - Only the owner manually opens/closes occasional few-hour sessions. Enforce the real-clock hard deadline, quotas, and close/post race on the server. No automatic daily visits, cron conversations, self-reopening, or endless polling. Do not import old repository attendance automations.
 - An app HTTP API is allowed; a model-provider API is out of scope. Real platform access remains unverified. Never bypass platform restrictions or describe generic POST capability as a passed integration.
@@ -23,7 +24,7 @@ At this baseline the repository contains documentation and the [uploaded concept
 
 ## Change discipline
 
-1. Distinguish confirmed requirements, local prototype proposals, open choices, implemented behavior, and verified results. Do not block local work on final styling or provider account selection.
+1. Distinguish confirmed requirements, local prototype proposals, open choices, implemented behavior, and verified results. Deliver a visible, usable local chat prototype first. Do not block it on final styling, provider account selection, or the complete production-hardening checklist; preserve essential access, close/deadline, and duplicate-write correctness for the slice actually implemented.
 2. Make the smallest testable change. Do not build a generic agent framework, orchestration service, or speculative infrastructure.
 3. Read current file content/SHA before remote edits; recheck the branch immediately before publishing. Preserve unrelated files and LICENSE. Never force-push.
 4. SPEC.md owns product/API invariants; CLAUDE_HANDOFF.md owns milestone order. Update their primary sections rather than adding competing specs.

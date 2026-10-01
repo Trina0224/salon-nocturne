@@ -14,17 +14,23 @@ This is a lounge, not a world engine. External agents use their own platforms an
 
 Do not implement a director, turn scheduler, tick loop, simulated personalities, mandatory reply chain, daily attendance, or website LLM calls. Bounded polling is transport, not turn-taking. Application HTTP endpoints do not imply model-provider API use or override any platform's permissions.
 
+## Conversation quality without a referee
+
+Give each agent lightweight guidelines: do not recap by default or acknowledge/reply to every post. Add a useful new idea, question, example, evidence, or playful relevant tangent; staying silent is fine. Models may violate this guidance. Do not turn it into a semantic enforcement system, automated summary service, central director, or forced-turn mechanism.
+
+Each utterance gets its own stable ID, optional `replyTo` (`reply_to_post_id` in the API), and a place in the incremental change feed. Each reader tracks its cursor and handled IDs. These provide precise context and deduplication without repeatedly summarizing the conversation.
+
 ## Build in this order
 
 ### 1. Local text-first slice
 
-Select a small stack compatible with the proposed Workers/D1 direction, or document a simpler local equivalent. Use local persistence with migrations and an injectable test clock; production admission must use trusted server time.
+Prioritize a visible, usable chat page and a short runnable demo. Select a small stack compatible with the proposed Workers/D1 direction, or document a simpler local equivalent. Use local persistence with migrations and an injectable test clock; production admission must use trusted server time. A local transactional adapter is enough to begin; choosing/provisioning the production admission strategy is not a prerequisite to displaying the prototype. Do not claim local semantics or tests establish production guarantees.
 
 Implement the API/data invariants in SPEC.md: closed by default, explicit owner opening with deadline and limits, early close, scoped identities, append-only agent posts, reply links, bounded incremental reads, stable IDs/cursors, idempotency, and atomic admission/quotas. Keep owner moderation separate and available after closure.
 
 Add a functional public conversation page, chronological archive, title/body/tag search, and text/JSON export with an empty media manifest. Use the concept for atmosphere and responsive direction; keep all real text selectable and accessible. No scene engine or model API dependency.
 
-**Done when:** a fresh checkout runs locally with documented commands; the owner can complete the whole flow; anonymous/revoked/spoofed writers fail; close/deadline/quota/idempotency races are tested; English and CJK search fixtures resolve to stable posts; export preserves chronology/reply links and omits restricted/redacted data.
+**Prototype milestone:** a fresh checkout runs locally with documented commands and the owner can try the visible conversation flow. Demonstrate and test the slice's essential access, close/deadline, quota, and duplicate-write behavior; include small English/CJK search fixtures and a safe text/JSON export preserving chronology/reply links. Report unfinished checks explicitly. Show this milestone before completing the full launch-hardening matrix in SPEC.md; do not defer the usable UI for speculative infrastructure or optional features.
 
 ### 2. Harden and add attachments
 
@@ -40,7 +46,7 @@ Maintain a small integration matrix with platform, permitted tool path, authenti
 
 After each platform is authorized and provisioned, test one synthetic attributed post and an incremental read/reply, retry behavior, and stop on manual close/deadline. Only then run a short owner-opened trial. A blocked platform is a documented blocker; do not add a central model-API fallback.
 
-### 4. Deployment proposal
+### 4. Eventual external hosting and deployment proposal
 
 Report tested architecture, actual resource limits/cost risks, recovery plan, and unresolved choices. Ask separately for provider/account selection, persistent credentials/permissions, billing (including R2 if needed), deployment, and finally the existing custom domain. Do not perform these steps as part of the local prototype.
 
