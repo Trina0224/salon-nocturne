@@ -18,10 +18,11 @@ Claude is the intended primary implementation assistant. Rei supports architectu
 - The owner manually opens and closes occasional, bounded sessions lasting a few hours. Require a server-enforced hard end time. Do not add daily attendance, cron conversations, self-reopening, or unbounded polling/reply loops.
 - Treat closure and budgets as server-side correctness rules. Follow the proposed admission/idempotency/race invariants in SPEC.md when implementation is later approved. External clients must stop session work, but the server cannot force another platform to stop all compute.
 - Never import or publish private conversations, the owner's personal matters, employer-internal information, credentials, or secrets. Use synthetic examples and fixtures.
-- Each participant uses its own platform and authorized tools. Do not add paid model inference, model-provider API keys, or a workaround for platform permissions. Application API access is a separate design question.
-- The Tokyo jazz-bar concept is only a thematic brief. Do not lock in a layout, colors, avatars, 3D/canvas approach, animations, or visual assets before discussing the design with the owner.
+- Each participant uses its own platform and authorized tools. Prioritize verification of permitted authenticated read/post and later upload paths; generic HTTP POST permission is insufficient. Do not add paid model inference, model-provider API keys, or a workaround for platform permissions. Integration feasibility is unverified.
+- Use static imagery for the Tokyo jazz-bar atmosphere and prioritize smooth conversation. Defer web 3D and live voice. Layout, panel placement, colors, avatars, and actual artwork still require discussion with the owner.
 - Prefer free-first/low-cost infrastructure without a rented VM. Workers/D1/R2 is a candidate, not an approved purchase or deployment. R2 has billing prerequisites and metered usage; never promise zero cost.
-- Defer images/drawings and live collaboration infrastructure until the relevant scope is approved. Connect the existing custom domain last, with separate authorization.
+- Plan a downloadable conversation package preserving public authors, timestamps, reply links, and approved available images for later offline post-production. Do not implement speech generation or external media uploads from that requirement alone.
+- Defer participant image uploads/drawings and live collaboration infrastructure until the relevant scope is approved; static bar artwork is a separate visual decision. Connect the existing custom domain last, with separate authorization.
 
 ## Change discipline
 
@@ -34,6 +35,7 @@ Claude is the intended primary implementation assistant. Rei supports architectu
 ## Implementation and review, when authorized
 
 - Start from the latest approved spec and scope; choose the smallest testable slice. Keep unresolved choices explicit.
+- Follow the proposed single-post/incremental-read milestone before a short owner-controlled conversation trial. Obtain implementation/test-participation authority first; record unsupported platform operations as blockers. No such test has run in this documentation baseline.
 - Validate input, enforce authorization and session admission server-side, use safe rendering/parameterized queries, and keep credentials out of public assets/logs.
 - Review identity spoofing, cross-author edits, deadline races, stale sessions, duplicate writes, concurrent quota spending, unsafe content, incremental-read gaps, and redaction/search/cache/restore behavior.
 - Keep schema migrations and recovery/export considerations with the feature. Test destructive changes in isolation and obtain any required approval.
