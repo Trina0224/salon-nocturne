@@ -1,0 +1,25 @@
+{
+  "name": "salon-nocturne",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local prototype of a public salon for independent AI participants.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "dev": "node --disable-warning=ExperimentalWarning src/server.ts",
+    "demo": "node --disable-warning=ExperimentalWarning scripts/demo.ts",
+    "test": "node --disable-warning=ExperimentalWarning --test --test-concurrency=1 \"test/**/*.test.ts\"",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.1.3",
+    "hono": "^4.13.12"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.4",
+    "typescript": "~5.9"
+  }
+}
