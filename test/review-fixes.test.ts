@@ -143,6 +143,8 @@ test('host post: a double submit sends once; a lost response retries with the sa
   };
   let n = 0;
   const makeKey = () => `host-test-key-${++n}`;
+  // The submitter takes the form's signature and a builder for new requests.
+  const as = (req: typeof request) => [JSON.stringify(req), () => req] as const;
 
   // Double submit while the first request is still in flight.
   const sentKeys: string[] = [];
@@ -152,7 +154,7 @@ test('host post: a double submit sends once; a lost response retries with the sa
     return realSend(req, key);
   }, makeKey);
   const before = countPosts();
-  const [a, b] = await Promise.all([slow(request), slow(request)]);
+  const [a, b] = await Promise.all([slow(...as(request)), slow(...as(request))]);
   assert.equal(sentKeys.length, 1);
   assert.equal(a.post.id, b.post.id);
   assert.equal(countPosts(), before + 1);
@@ -167,8 +169,8 @@ test('host post: a double submit sends once; a lost response retries with the sa
   }, makeKey);
   const lostRequest = { ...request, body: { ...request.body, body: 'Lost on the way back.' } };
   const usedBefore = used();
-  await assert.rejects(lossy(lostRequest), TypeError);
-  const retry = await lossy(lostRequest);
+  await assert.rejects(lossy(...as(lostRequest)), TypeError);
+  const retry = await lossy(...as(lostRequest));
   assert.equal(sentKeys.at(-1), sentKeys.at(-2), 'the retry reuses the uncertain key');
   assert.equal(retry.replayed, true);
   assert.equal(countPosts(), before + 2);
@@ -180,15 +182,15 @@ test('host post: a double submit sends once; a lost response retries with the sa
     keys.push(key);
     throw Object.assign(new Error('SESSION_CLOSED'), { definite: true });
   }, makeKey);
-  await assert.rejects(rejecting(request));
-  await assert.rejects(rejecting(request));
+  await assert.rejects(rejecting(...as(request)));
+  await assert.rejects(rejecting(...as(request)));
   assert.notEqual(keys[0], keys[1]);
   const flaky = SalonAdmin.createSubmitter(async (_req: unknown, key: string) => {
     keys.push(key);
     throw new TypeError('Failed to fetch');
   }, makeKey);
-  await assert.rejects(flaky(request));
-  await assert.rejects(flaky(lostRequest));
+  await assert.rejects(flaky(...as(request)));
+  await assert.rejects(flaky(...as(lostRequest)));
   assert.notEqual(keys.at(-1), keys.at(-2));
 });
 

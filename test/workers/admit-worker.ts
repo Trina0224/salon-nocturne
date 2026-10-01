@@ -9,9 +9,11 @@ import { ApiError } from '../../src/domain/errors.ts';
 
 export type Job =
   | { kind: 'post'; token: string; threadId: string; sessionId: string; generation: number; key: string; body: string }
+  // Keeps posting (pausing briefly so other writers get the lock) until refused.
+  | { kind: 'post-until-refused'; token: string; threadId: string; sessionId: string; generation: number; keyPrefix: string; max: number; pauseMs: number }
   | { kind: 'close'; token: string; sessionId: string; afterPosts: number };
 
-export type Outcome = { kind: Job['kind']; status: number; code?: string; id?: string };
+export type Outcome = { kind: 'post' | 'close'; status: number; code?: string; id?: string };
 
 const { dbPath, gate, jobs } = workerData as { dbPath: string; gate: SharedArrayBuffer; jobs: Job[] };
 const db = openDatabase(dbPath);
@@ -24,11 +26,25 @@ function actor(token: string) {
 }
 
 Atomics.wait(new Int32Array(gate), 0, 0);
+const pause = new Int32Array(new SharedArrayBuffer(4));
 
 const outcomes: Outcome[] = [];
 for (const job of jobs) {
   try {
-    if (job.kind === 'post') {
+    if (job.kind === 'post-until-refused') {
+      for (let i = 0; i < job.max; i++) {
+        try {
+          const r = ledger.createPost(actor(job.token), job.threadId,
+            { body: `${job.keyPrefix} post ${i}`, session_id: job.sessionId, generation: job.generation }, `${job.keyPrefix}-${i}`);
+          outcomes.push({ kind: 'post', status: r.status, id: r.value.id });
+        } catch (err) {
+          if (!(err instanceof ApiError)) throw err;
+          outcomes.push({ kind: 'post', status: err.status, code: err.code });
+          break;
+        }
+        Atomics.wait(pause, 0, 0, job.pauseMs);
+      }
+    } else if (job.kind === 'post') {
       const r = ledger.createPost(actor(job.token), job.threadId,
         { body: job.body, session_id: job.sessionId, generation: job.generation }, job.key);
       outcomes.push({ kind: 'post', status: r.status, id: r.value.id });
@@ -40,7 +56,7 @@ for (const job of jobs) {
     }
   } catch (err) {
     if (!(err instanceof ApiError)) throw err;
-    outcomes.push({ kind: job.kind, status: err.status, code: err.code });
+    outcomes.push({ kind: job.kind === 'close' ? 'close' : 'post', status: err.status, code: err.code });
   }
 }
 db.close();

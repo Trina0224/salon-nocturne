@@ -65,11 +65,13 @@ test('concurrent writers spend the last quota unit exactly once', async () => {
 test('a close racing many posts has one committed order', async () => {
   const { dir, dbPath, salon, session, threadId } = fileSalon({ maxPosts: 2000, maxPostsPerParticipant: 500, maxThreads: 2, maxBodyChars: 200 });
   try {
-    const posters: Job[][] = Array.from({ length: 5 }, (_, w) =>
-      Array.from({ length: 40 }, (_, i) => ({
-        kind: 'post' as const, token: agents[w % 3]!, threadId, sessionId: session.id, generation: session.generation,
-        key: `race-${w}-${i}-key`, body: `Worker ${w} post ${i}`,
-      })));
+    // Each poster keeps posting until it is refused, pausing 1 ms between
+    // posts so the closer can take the write lock (SQLite locking is not
+    // fair). The close therefore always lands mid-race.
+    const posters: Job[][] = Array.from({ length: 5 }, (_, w) => [{
+      kind: 'post-until-refused' as const, token: agents[w % 3]!, threadId, sessionId: session.id, generation: session.generation,
+      keyPrefix: `race-${w}`, max: 390, pauseMs: 1,
+    }]);
     const closer: Job[] = [{ kind: 'close', token: TOKENS.owner, sessionId: session.id, afterPosts: 30 }];
     const outcomes = await race(dbPath, [...posters, closer]);
 
@@ -77,7 +79,8 @@ test('a close racing many posts has one committed order', async () => {
     const admitted = posts.filter((o) => o.status === 201).length;
     const refused = posts.filter((o) => o.code === 'SESSION_CLOSED').length;
     assert.equal(admitted + refused, posts.length, 'every post was either admitted or refused as closed');
-    assert.ok(admitted >= 29 && refused > 0, `the close landed mid-race (admitted ${admitted}, refused ${refused})`);
+    assert.equal(refused, 5, 'every poster was stopped by the close, none ran out of attempts');
+    assert.ok(admitted >= 29, `the close waited for the race to start (admitted ${admitted})`);
     assert.deepEqual(outcomes.filter((o) => o.kind === 'close').map((o) => o.status), [200]);
 
     const closeSeq = Number(salon.db.prepare("SELECT MAX(seq) AS s FROM changes WHERE resource_type = 'session'").get()!.s);

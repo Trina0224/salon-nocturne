@@ -5,28 +5,44 @@
 
   /**
    * Wraps an idempotent write. While a request is in flight, further submits
-   * return the same promise instead of sending again. If the outcome is
-   * unknown (network failure, lost response, 5xx), a retry of the identical
-   * request reuses the same Idempotency-Key, so the server replays the
-   * original result rather than writing twice. A definite rejection (4xx)
-   * or a success clears the remembered key.
+   * return the same promise instead of sending again.
+   *
+   * `signature` identifies what the user asked for (the form's contents);
+   * `build` turns it into a concrete request (destination, session, body) and
+   * is called only for a genuinely new submission. If an attempt's outcome is
+   * unknown (network failure, lost or unreadable response, 5xx), resubmitting
+   * the same signature resends that exact request with the same
+   * Idempotency-Key, so the server replays the original result instead of
+   * writing twice or writing into a different session. A definite rejection
+   * (4xx) or a valid receipt clears it.
    */
   function createSubmitter(send, makeKey) {
     var inFlight = null;
     var uncertain = null;
-    return function submit(request) {
+    return function submit(signature, build) {
       if (inFlight) return inFlight;
-      var text = JSON.stringify(request);
-      var key = uncertain && uncertain.text === text ? uncertain.key : makeKey();
+      var retry = uncertain && uncertain.signature === signature ? uncertain : null;
       inFlight = Promise.resolve()
-        .then(function () { return send(request, key); })
+        .then(function () {
+          if (retry) return retry;
+          return Promise.resolve(build()).then(function (request) {
+            return { signature: signature, request: request, key: makeKey() };
+          });
+        })
+        .then(function (attempt) {
+          return send(attempt.request, attempt.key).then(function (result) {
+            uncertain = null;
+            return result;
+          }, function (err) {
+            uncertain = err && err.definite ? null : attempt;
+            throw err;
+          });
+        })
         .then(function (result) {
           inFlight = null;
-          uncertain = null;
           return result;
         }, function (err) {
           inFlight = null;
-          uncertain = err && err.definite ? null : { text: text, key: key };
           throw err;
         });
       return inFlight;
@@ -57,7 +73,13 @@
     Object.assign(headers, extraHeaders || {});
     return fetch('/api/v1' + path, { method: method, headers: headers, body: body ? JSON.stringify(body) : undefined })
       .then(function (r) {
-        return r.json().catch(function () { return {}; }).then(function (data) {
+        return r.json().catch(function () {
+          // An unreadable body (e.g. an interrupted response) after a success
+          // status or a 5xx leaves the outcome unknown.
+          var err = new Error('The server response could not be read.');
+          err.definite = !r.ok && r.status < 500;
+          throw err;
+        }).then(function (data) {
           if (!r.ok) {
             var err = new Error((data.error && data.error.code) + ': ' + (data.error && data.error.message));
             // The server answered: a 4xx was definitely not written.
@@ -88,8 +110,8 @@
       Promise.resolve()
         .then(function () { return handler(new FormData(form), form); })
         .catch(function (err) {
-          say(err.definite === false || err instanceof TypeError
-            ? 'No response from the server. Submitting again safely retries the same request.'
+          say(err.definite === false || err.name === 'TypeError'
+            ? 'No confirmed response from the server. Submit again without changes to retry the same request safely.'
             : err.message, true);
         })
         .then(function () {
@@ -99,8 +121,17 @@
     });
   }
 
+  // A host write counts as done only with a valid receipt; anything else is
+  // an unknown outcome to retry with the same request and key.
   var submitHostPost = createSubmitter(function (request, idempotencyKey) {
-    return call('POST', request.path, request.body, { 'Idempotency-Key': idempotencyKey });
+    return call('POST', request.path, request.body, { 'Idempotency-Key': idempotencyKey }).then(function (d) {
+      if (!d || !d.post || typeof d.post.id !== 'string') {
+        var err = new Error('The server response had no receipt.');
+        err.definite = false;
+        throw err;
+      }
+      return d;
+    });
   }, key);
 
   on('[data-admin-token]', function (f, form) {
@@ -137,24 +168,29 @@
   });
 
   on('[data-admin-post]', function (f, form) {
-    return current().then(function (s) {
-      var thread = String(f.get('thread') || '').trim();
-      var body = String(f.get('body') || '');
-      if (thread) {
-        return submitHostPost({
-          path: '/threads/' + encodeURIComponent(thread) + '/posts',
-          body: { body: body, session_id: s.id, generation: s.generation },
-        });
-      }
-      var tags = String(f.get('tags') || '').split(',').map(function (t) { return t.trim(); }).filter(Boolean);
-      return submitHostPost({
-        path: '/sessions/' + s.id + '/threads',
-        body: { title: String(f.get('title') || ''), tags: tags, body: body, generation: s.generation },
+    var thread = String(f.get('thread') || '').trim();
+    var title = String(f.get('title') || '');
+    var tags = String(f.get('tags') || '').split(',').map(function (t) { return t.trim(); }).filter(Boolean);
+    var body = String(f.get('body') || '');
+    var signature = JSON.stringify([thread, title, tags, body]);
+    // The current session is looked up only for a new submission; a retry of
+    // an uncertain one keeps its original session and destination.
+    return submitHostPost(signature, function () {
+      return current().then(function (s) {
+        if (thread) {
+          return {
+            path: '/threads/' + encodeURIComponent(thread) + '/posts',
+            body: { body: body, session_id: s.id, generation: s.generation },
+          };
+        }
+        return {
+          path: '/sessions/' + s.id + '/threads',
+          body: { title: title, tags: tags, body: body, generation: s.generation },
+        };
       });
     }).then(function (d) {
       form.reset();
-      var id = d.post ? d.post.id : '';
-      say('Posted ' + id + '.');
+      say('Posted ' + d.post.id + (d.replayed ? ' (confirmed on retry).' : '.'));
     });
   });
 
