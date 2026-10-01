@@ -13,7 +13,13 @@ import { postView, sessionView, threadView, type PostView, type SessionView, typ
 
 export const DEFAULT_LIMIT = 50;
 export const MAX_LIMIT = 100;
-const PAGE_BYTE_CAP = 256 * 1024;
+/** Hard cap on the UTF-8 size of any paginated JSON response. */
+export const PAGE_BYTE_CAP = 256 * 1024;
+// Room for cursors, the schema_version wrapper, and has_more flags, which are
+// added after items are chosen.
+const ENVELOPE_RESERVE = 1024;
+// Posts shown before a linked post when a page opens at that post.
+const AT_CONTEXT = 3;
 const MAX_EXPORT_POSTS = 5000;
 const MAX_QUERY_CHARS = 100;
 const MAX_QUERY_TERMS = 5;
@@ -31,10 +37,40 @@ export interface Page<T> {
   has_more: boolean;
 }
 
+export interface PostPage extends Page<PostView & { thread_title: string }> {
+  /** Highest committed sequence this page's snapshot includes. */
+  watermark: number;
+  /** Same starting point, fresh snapshot: use to show newly arrived posts. */
+  refresh_cursor: string;
+  /** False when the page starts after the first post of the listing. */
+  starts_at_beginning: boolean;
+}
+
+export const utf8Bytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value), 'utf8');
+
+/**
+ * Keeps items in order while the whole response, envelope included, stays
+ * within PAGE_BYTE_CAP UTF-8 bytes. At least one item is always kept (a single
+ * maximal post is far below the cap), so pagination always makes progress.
+ */
+export function fitToBudget<T>(envelope: unknown, items: T[]): { kept: T[]; truncated: boolean } {
+  let used = utf8Bytes(envelope) + ENVELOPE_RESERVE;
+  const kept: T[] = [];
+  for (const item of items) {
+    const size = utf8Bytes(item) + 1;
+    if (kept.length > 0 && used + size > PAGE_BYTE_CAP) return { kept, truncated: true };
+    used += size;
+    kept.push(item);
+  }
+  return { kept, truncated: false };
+}
+
 export interface SessionStats {
   posts_published: number;
   speakers: { id: string; display_name: string }[];
   latest_seq: number;
+  /** Sequence of the newest post in the session (0 if none). */
+  latest_post_seq: number;
 }
 
 export interface SearchHit {
@@ -81,8 +117,9 @@ export class ReadModel {
       .prepare('SELECT * FROM sessions WHERE generation < ? ORDER BY generation DESC LIMIT ?')
       .all(before, limit + 1)
       .map(sessionFromRow);
-    const more = rows.length > limit;
-    const items = rows.slice(0, limit).map((s) => ({ ...sessionView(s, nowMs), stats: this.stats(s.id) }));
+    const fit = fitToBudget({ items: [] }, rows.slice(0, limit).map((s) => ({ ...sessionView(s, nowMs), stats: this.stats(s.id) })));
+    const items = fit.kept;
+    const more = fit.truncated || rows.length > limit;
     const last = items.at(-1);
     return {
       items,
@@ -105,12 +142,20 @@ export class ReadModel {
     return { session: sessionView(s, nowMs), stats: this.stats(id), threads };
   }
 
+  /** Lightweight public status of one specific session, for pages watching it. */
+  sessionStatus(id: string): { session: SessionView; stats: SessionStats; server_now: string } {
+    const nowMs = this.clock.now();
+    const s = loadSession(this.db, id);
+    if (!s) throw notFound('Session');
+    return { session: sessionView(s, nowMs), stats: this.stats(id), server_now: toIso(nowMs) };
+  }
+
   /** All posts of a session in chronological order, optionally by thread tag. */
-  sessionPosts(sessionId: string, opts: { tag?: string; cursor?: string; limit: number }): Page<PostView & { thread_title: string }> {
+  sessionPosts(sessionId: string, opts: { tag?: string; cursor?: string; limit: number }): PostPage {
     if (!loadSession(this.db, sessionId)) throw notFound('Session');
     const tag = opts.tag?.trim().toLowerCase() || undefined;
     const scope = `session-posts:${sessionId}:${tag ?? ''}`;
-    return this.ascendingPosts(scope, opts.cursor, opts.limit, (after, watermark, take) => {
+    return this.ascendingPosts(scope, opts.cursor, opts.limit, { items: [] }, 0, (after, watermark, take) => {
       const tagClause = tag ? 'AND EXISTS (SELECT 1 FROM json_each(t.tags) WHERE value = ?)' : '';
       const params: (string | number)[] = [sessionId, after, watermark];
       if (tag) params.push(tag);
@@ -125,18 +170,34 @@ export class ReadModel {
     });
   }
 
-  threadPosts(threadId: string, cursor: string | undefined, limit: number): { thread: ThreadView; session: SessionView } & Page<PostView & { thread_title: string }> {
+  /**
+   * Posts of one thread. With `at` (and no cursor) the page opens a few posts
+   * before that post, so links to posts on later pages still land on them.
+   */
+  threadPosts(threadId: string, opts: { cursor?: string; limit: number; at?: string }): { thread: ThreadView; session: SessionView } & PostPage {
     const t = loadThread(this.db, threadId);
     if (!t) throw notFound('Thread');
-    const page = this.ascendingPosts(`thread-posts:${threadId}`, cursor, limit, (after, watermark, take) =>
-      this.db
-        .prepare(
-          `SELECT p.*, ? AS thread_title FROM posts p
-           WHERE p.thread_id = ? AND p.seq > ? AND p.seq <= ? ORDER BY p.seq LIMIT ?`,
-        )
-        .all(t.title, threadId, after, watermark, take),
+    const session = sessionView(loadSession(this.db, t.sessionId)!, this.clock.now());
+    let startAfter = 0;
+    if (opts.at && !opts.cursor) {
+      const target = loadPost(this.db, opts.at);
+      if (target && target.threadId === threadId) {
+        const before = this.db
+          .prepare('SELECT seq FROM posts WHERE thread_id = ? AND seq < ? ORDER BY seq DESC LIMIT ?')
+          .all(threadId, target.seq, AT_CONTEXT + 1);
+        startAfter = before.length > AT_CONTEXT ? Number(before[AT_CONTEXT]!.seq) : 0;
+      }
+    }
+    const page = this.ascendingPosts(`thread-posts:${threadId}`, opts.cursor, opts.limit,
+      { thread: threadView(t), session, items: [] }, startAfter, (after, watermark, take) =>
+        this.db
+          .prepare(
+            `SELECT p.*, ? AS thread_title FROM posts p
+             WHERE p.thread_id = ? AND p.seq > ? AND p.seq <= ? ORDER BY p.seq LIMIT ?`,
+          )
+          .all(t.title, threadId, after, watermark, take),
     );
-    return { thread: threadView(t), session: sessionView(loadSession(this.db, t.sessionId)!, this.clock.now()), ...page };
+    return { thread: threadView(t), session, ...page };
   }
 
   /** Author and visibility of reply targets, for "Replying to …" labels. */
@@ -200,30 +261,21 @@ export class ReadModel {
     const rows = this.db
       .prepare('SELECT * FROM changes WHERE session_id = ? AND seq > ? ORDER BY seq LIMIT ?')
       .all(sessionId, after, limit + 1);
-    const changes: unknown[] = [];
-    let last = after;
-    let bytes = 0;
-    let truncated = false;
-    for (const r of rows.slice(0, limit)) {
-      const item = this.changeItem(r, nowMs);
-      const size = JSON.stringify(item).length;
-      if (changes.length > 0 && bytes + size > PAGE_BYTE_CAP) {
-        truncated = true;
-        break;
-      }
-      bytes += size;
-      changes.push(item);
-      last = Number(r.seq);
-    }
-    return {
+    const envelope = {
       schema_version: 1,
       session: status,
       stop: false,
       budgets: this.budgets(s, actor),
       poll: { suggested_interval_seconds: 30, jitter_seconds: 10, note: 'Polling is transport only. Silence is always allowed.' },
-      changes,
+    };
+    const candidates = rows.slice(0, limit).map((r) => ({ ...this.changeItem(r, nowMs) }));
+    const fit = fitToBudget({ ...envelope, changes: [] }, candidates);
+    const last = fit.kept.length > 0 ? fit.kept.at(-1)!.seq : after;
+    return {
+      ...envelope,
+      changes: fit.kept,
       next_cursor: this.cursors.encode({ scope, after: last, watermark: 0 }, nowMs),
-      has_more: truncated || rows.length > limit,
+      has_more: fit.truncated || rows.length > limit,
     };
   }
 
@@ -268,10 +320,9 @@ export class ReadModel {
          ORDER BY s.rowid DESC LIMIT ?`,
       )
       .all(...params);
-    const more = rows.length > limit;
-    const kept = rows.slice(0, limit);
-    const names = displayNames(this.db, kept.map((r) => String(r.author_id)));
-    const items: SearchHit[] = kept.map((r) => {
+    const candidates = rows.slice(0, limit);
+    const names = displayNames(this.db, candidates.map((r) => String(r.author_id)));
+    const hits: SearchHit[] = candidates.map((r) => {
       const p = postFromRow(r);
       return {
         post_id: p.id,
@@ -286,7 +337,10 @@ export class ReadModel {
         url: `/posts/${p.id}`,
       };
     });
-    const lastSeq = kept.length > 0 ? Number(kept.at(-1)!.seq) : 0;
+    const fit = fitToBudget({ query: q, items: [] }, hits);
+    const items = fit.kept;
+    const more = fit.truncated || rows.length > limit;
+    const lastSeq = items.length > 0 ? Number(candidates[items.length - 1]!.seq) : 0;
     return {
       query: q,
       items,
@@ -352,24 +406,42 @@ export class ReadModel {
 
   // ---- internals ---------------------------------------------------------------
 
-  private ascendingPosts(scope: string, cursorRaw: string | undefined, limit: number,
-    fetch: (after: number, watermark: number, take: number) => Record<string, unknown>[]): Page<PostView & { thread_title: string }> {
+  /**
+   * Ascending, gap-free pagination by committed sequence. A cursor freezes a
+   * snapshot (watermark) so pages never shift while posts arrive; when the
+   * snapshot is exhausted but newer posts exist, next_cursor continues into a
+   * fresh snapshot instead of ending the listing. A cursor whose watermark is
+   * negative means "fresh snapshot from this position" (see refresh_cursor).
+   */
+  private ascendingPosts(scope: string, cursorRaw: string | undefined, limit: number, envelope: Record<string, unknown>,
+    startAfter: number, fetch: (after: number, watermark: number, take: number) => Record<string, unknown>[]): PostPage {
     const nowMs = this.clock.now();
     const cur: CursorState | null = this.cursors.decode(cursorRaw, scope, nowMs);
-    const watermark = cur?.watermark ?? this.maxSeq();
-    const rows = fetch(cur?.after ?? 0, watermark, limit + 1);
-    const more = rows.length > limit;
-    const kept = rows.slice(0, limit);
-    const names = displayNames(this.db, kept.map((r) => String(r.author_id)));
-    const items = kept.map((r) => {
+    const latest = this.maxSeq();
+    const watermark = cur && cur.watermark >= 0 ? cur.watermark : latest;
+    const after = cur ? cur.after : startAfter;
+    const rows = fetch(after, watermark, limit + 1);
+    const candidates = rows.slice(0, limit);
+    const names = displayNames(this.db, candidates.map((r) => String(r.author_id)));
+    const views = candidates.map((r) => {
       const p = postFromRow(r);
       return { ...postView(p, names.get(p.authorId)!), thread_title: String(r.thread_title) };
     });
-    const lastSeq = kept.length > 0 ? Number(kept.at(-1)!.seq) : 0;
+    const fit = fitToBudget(envelope, views);
+    const lastSeq = fit.kept.length > 0 ? Number(candidates[fit.kept.length - 1]!.seq) : after;
+    let next: string | null = null;
+    if (fit.truncated || rows.length > limit) {
+      next = this.cursors.encode({ scope, after: lastSeq, watermark }, nowMs);
+    } else if (watermark < latest && fetch(lastSeq, latest, 1).length > 0) {
+      next = this.cursors.encode({ scope, after: lastSeq, watermark: -1 }, nowMs);
+    }
     return {
-      items,
-      has_more: more,
-      next_cursor: more ? this.cursors.encode({ scope, after: lastSeq, watermark }, nowMs) : null,
+      items: fit.kept,
+      has_more: next !== null,
+      next_cursor: next,
+      watermark,
+      refresh_cursor: this.cursors.encode({ scope, after, watermark: -1 }, nowMs),
+      starts_at_beginning: after === 0,
     };
   }
 
@@ -410,10 +482,12 @@ export class ReadModel {
       )
       .all(sessionId);
     const latest = this.db.prepare('SELECT COALESCE(MAX(seq), 0) AS s FROM changes WHERE session_id = ?').get(sessionId)!;
+    const latestPost = this.db.prepare('SELECT COALESCE(MAX(seq), 0) AS s FROM posts WHERE session_id = ?').get(sessionId)!;
     return {
       posts_published: published,
       speakers: speakerRows.map((r) => ({ id: String(r.author_id), display_name: String(r.display_name) })),
       latest_seq: Number(latest.s),
+      latest_post_seq: Number(latestPost.s),
     };
   }
 

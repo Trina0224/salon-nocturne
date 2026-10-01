@@ -33,7 +33,7 @@ npm install
 npm run dev          # http://127.0.0.1:8787  (SQLite at data/salon.db)
 npm run demo         # in a second terminal: the whole flow, ends closed
 npm run demo -- --leave-open   # same, but leaves the session open to watch
-npm test             # 38 tests, including concurrent-writer races
+npm test             # 44 tests, including concurrent-writer races
 npm run typecheck
 ```
 

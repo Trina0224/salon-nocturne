@@ -1,7 +1,41 @@
 // Host controls for the local prototype. The owner token lives only in this
 // tab's sessionStorage and is sent as a bearer header (no cookies, no CSRF).
-(function () {
+(function (root) {
   'use strict';
+
+  /**
+   * Wraps an idempotent write. While a request is in flight, further submits
+   * return the same promise instead of sending again. If the outcome is
+   * unknown (network failure, lost response, 5xx), a retry of the identical
+   * request reuses the same Idempotency-Key, so the server replays the
+   * original result rather than writing twice. A definite rejection (4xx)
+   * or a success clears the remembered key.
+   */
+  function createSubmitter(send, makeKey) {
+    var inFlight = null;
+    var uncertain = null;
+    return function submit(request) {
+      if (inFlight) return inFlight;
+      var text = JSON.stringify(request);
+      var key = uncertain && uncertain.text === text ? uncertain.key : makeKey();
+      inFlight = Promise.resolve()
+        .then(function () { return send(request, key); })
+        .then(function (result) {
+          inFlight = null;
+          uncertain = null;
+          return result;
+        }, function (err) {
+          inFlight = null;
+          uncertain = err && err.definite ? null : { text: text, key: key };
+          throw err;
+        });
+      return inFlight;
+    };
+  }
+
+  root.SalonAdmin = { createSubmitter: createSubmitter };
+  if (typeof document === 'undefined') return;
+
   var KEY = 'salon.ownerToken';
   var out = document.querySelector('[data-admin-output]');
 
@@ -23,8 +57,13 @@
     Object.assign(headers, extraHeaders || {});
     return fetch('/api/v1' + path, { method: method, headers: headers, body: body ? JSON.stringify(body) : undefined })
       .then(function (r) {
-        return r.json().then(function (data) {
-          if (!r.ok) throw new Error((data.error && data.error.code) + ': ' + (data.error && data.error.message));
+        return r.json().catch(function () { return {}; }).then(function (data) {
+          if (!r.ok) {
+            var err = new Error((data.error && data.error.code) + ': ' + (data.error && data.error.message));
+            // The server answered: a 4xx was definitely not written.
+            err.definite = r.status < 500;
+            throw err;
+          }
           return data;
         });
       });
@@ -35,14 +74,34 @@
       return d.session;
     });
   }
+  // One submission per form at a time; the button is disabled meanwhile.
   function on(selector, handler) {
     var form = document.querySelector(selector);
+    var submitButton = form.querySelector('[type="submit"]');
+    var busy = false;
     form.addEventListener('submit', function (ev) {
       ev.preventDefault();
+      if (busy) return;
       if (!token() && selector !== '[data-admin-token]') { say('Enter the owner token first.', true); return; }
-      Promise.resolve(handler(new FormData(form), form)).catch(function (err) { say(err.message, true); });
+      busy = true;
+      if (submitButton) submitButton.disabled = true;
+      Promise.resolve()
+        .then(function () { return handler(new FormData(form), form); })
+        .catch(function (err) {
+          say(err.definite === false || err instanceof TypeError
+            ? 'No response from the server. Submitting again safely retries the same request.'
+            : err.message, true);
+        })
+        .then(function () {
+          busy = false;
+          if (submitButton) submitButton.disabled = false;
+        });
     });
   }
+
+  var submitHostPost = createSubmitter(function (request, idempotencyKey) {
+    return call('POST', request.path, request.body, { 'Idempotency-Key': idempotencyKey });
+  }, key);
 
   on('[data-admin-token]', function (f, form) {
     try { sessionStorage.setItem(KEY, String(f.get('token'))); } catch (e) { /* ignore */ }
@@ -82,12 +141,16 @@
       var thread = String(f.get('thread') || '').trim();
       var body = String(f.get('body') || '');
       if (thread) {
-        return call('POST', '/threads/' + thread + '/posts',
-          { body: body, session_id: s.id, generation: s.generation }, { 'Idempotency-Key': key() });
+        return submitHostPost({
+          path: '/threads/' + encodeURIComponent(thread) + '/posts',
+          body: { body: body, session_id: s.id, generation: s.generation },
+        });
       }
       var tags = String(f.get('tags') || '').split(',').map(function (t) { return t.trim(); }).filter(Boolean);
-      return call('POST', '/sessions/' + s.id + '/threads',
-        { title: f.get('title'), tags: tags, body: body, generation: s.generation }, { 'Idempotency-Key': key() });
+      return submitHostPost({
+        path: '/sessions/' + s.id + '/threads',
+        body: { title: String(f.get('title') || ''), tags: tags, body: body, generation: s.generation },
+      });
     }).then(function (d) {
       form.reset();
       var id = d.post ? d.post.id : '';
@@ -105,4 +168,4 @@
       })
       .then(function (d) { say('Post ' + d.post.id + ' removed.'); });
   });
-})();
+})(typeof window !== 'undefined' ? window : globalThis);

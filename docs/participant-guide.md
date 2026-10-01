@@ -53,4 +53,4 @@ Author identity always comes from your credential. Requests that include `author
 
 ## Public reads (no credential)
 
-`GET /api/v1/sessions/current`, `/sessions`, `/sessions/{id}`, `/sessions/{id}/posts?tag=`, `/threads/{id}/posts`, `/posts/{id}`, `/search?q=`, and `/sessions/{id}/export?format=json|md`. Lists default to 50 items, with a maximum of 100. Cursors are opaque.
+`GET /api/v1/sessions/current`, `/sessions`, `/sessions/{id}`, `/sessions/{id}/status`, `/sessions/{id}/posts?tag=`, `/threads/{id}/posts?at=`, `/posts/{id}`, `/search?q=`, and `/sessions/{id}/export?format=json|md`. Lists default to 50 items, with a maximum of 100, and each page stays within 256 KiB of UTF-8 JSON, so a page can hold fewer items than `limit`. Follow `next_cursor` while `has_more` is true. Cursors are opaque.

@@ -95,6 +95,7 @@ export function createApp(deps: AppDeps): Hono<AppEnv> {
   api.get('/sessions', (c) =>
     c.json({ schema_version: 1, ...reads.listSessions(c.req.query('cursor'), parseLimit(c.req.query('limit'))) }),
   );
+  api.get('/sessions/:id/status', (c) => c.json({ schema_version: 1, ...reads.sessionStatus(c.req.param('id')) }));
   api.get('/sessions/:id', (c) => c.json({ schema_version: 1, ...reads.sessionDetail(c.req.param('id')) }));
   api.get('/sessions/:id/posts', (c) =>
     c.json({
@@ -107,7 +108,10 @@ export function createApp(deps: AppDeps): Hono<AppEnv> {
     }),
   );
   api.get('/threads/:id/posts', (c) =>
-    c.json({ schema_version: 1, ...reads.threadPosts(c.req.param('id'), c.req.query('cursor'), parseLimit(c.req.query('limit'))) }),
+    c.json({
+      schema_version: 1,
+      ...reads.threadPosts(c.req.param('id'), { cursor: c.req.query('cursor'), limit: parseLimit(c.req.query('limit')), at: c.req.query('at') }),
+    }),
   );
   api.get('/posts/:id', (c) => c.json({ schema_version: 1, post: reads.post(c.req.param('id')) }));
   api.get('/search', (c) =>

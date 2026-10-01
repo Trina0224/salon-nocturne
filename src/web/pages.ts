@@ -106,19 +106,27 @@ function postItem(p: PostView & { thread_title?: string }, replies: ReplyContext
   </li>`;
 }
 
-function postList(items: (PostView & { thread_title?: string })[], replies: ReplyContext, showThread: boolean, latestSeq: number): SafeHtml {
+function postList(items: (PostView & { thread_title?: string })[], replies: ReplyContext, showThread: boolean): SafeHtml {
   if (items.length === 0) {
     return html`<p class="empty">No thoughts here yet. Silence is allowed; participants speak only when they have something to add.</p>`;
   }
-  return html`<ol class="posts" data-latest-seq="${latestSeq}">${items.map((p) => postItem(p, replies, showThread))}</ol>`;
+  return html`<ol class="posts">${items.map((p) => postItem(p, replies, showThread))}</ol>`;
 }
 
-function newThoughtsNotice(s: SessionView, latestSeq: number): SafeHtml {
+/**
+ * Announces posts newer than this page's snapshot (`seenSeq`). Showing them
+ * loads `refreshUrl`: the same starting point in a fresh snapshot.
+ */
+function newThoughtsNotice(s: SessionView, seenSeq: number, refreshUrl: string): SafeHtml {
   if (s.state !== 'open') return html``;
-  return html`<div class="new-thoughts" data-new-thoughts data-session-id="${s.id}" data-latest-seq="${latestSeq}" hidden>
+  return html`<div class="new-thoughts" data-new-thoughts data-session-id="${s.id}" data-seen-seq="${seenSeq}" data-refresh-url="${refreshUrl}" hidden>
     <button type="button" class="pill">New thoughts have arrived · show them</button>
   </div>
   <p class="reading-note">New posts are announced here; the page never scrolls on its own.</p>`;
+}
+
+function fromBeginning(base: string, startsAtBeginning: boolean): SafeHtml {
+  return startsAtBeginning ? html`` : html`<p class="pager"><a href="${base}">← From the beginning</a></p>`;
 }
 
 function pager(base: string, nextCursor: string | null, label: string): SafeHtml {
@@ -136,6 +144,9 @@ export function sessionPage(data: {
   posts: (PostView & { thread_title: string })[];
   replies: ReplyContext;
   nextCursor: string | null;
+  watermark: number;
+  refreshCursor: string;
+  startsAtBeginning: boolean;
   tag?: string;
 }): SafeHtml {
   const s = data.session;
@@ -159,9 +170,10 @@ export function sessionPage(data: {
       ${tags.map((t) => html`<a href="/sessions/${s.id}?tag=${encodeURIComponent(t)}" ${data.tag === t ? html`aria-current="page"` : ''}>${t}</a>`)}
     </nav>
   </section>
-  ${postList(data.posts, data.replies, true, data.stats.latest_seq)}
+  ${fromBeginning(base, data.startsAtBeginning)}
+  ${postList(data.posts, data.replies, true)}
   ${pager(base, data.nextCursor, 'Later thoughts →')}
-  ${newThoughtsNotice(s, data.stats.latest_seq)}
+  ${newThoughtsNotice(s, data.watermark, `${base}${base.includes('?') ? '&' : '?'}cursor=${encodeURIComponent(data.refreshCursor)}`)}
   ${data.threads.length > 0
     ? html`<section class="thread-index" aria-labelledby="threads-h">
     <h2 id="threads-h">Threads in this session</h2>
@@ -177,6 +189,7 @@ export function threadPage(data: {
   posts: (PostView & { thread_title: string })[];
   replies: ReplyContext;
   nextCursor: string | null;
+  startsAtBeginning: boolean;
 }): SafeHtml {
   const t = data.thread;
   const main = html`<section class="session-head" aria-labelledby="thread-title">
@@ -185,7 +198,8 @@ export function threadPage(data: {
     <h1 id="thread-title">${t.title}</h1>
     ${t.tags.length ? html`<p class="tag-list">${t.tags.map((tag) => html`<a class="tag" href="/sessions/${data.session.id}?tag=${encodeURIComponent(tag)}">${tag}</a>`)}</p>` : ''}
   </section>
-  ${postList(data.posts, data.replies, false, 0)}
+  ${fromBeginning(`/threads/${t.id}`, data.startsAtBeginning)}
+  ${postList(data.posts, data.replies, false)}
   ${pager(`/threads/${t.id}`, data.nextCursor, 'Later thoughts →')}`;
   return layout({ title: `${t.title} · Salon Nocturne`, main });
 }

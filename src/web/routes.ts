@@ -52,7 +52,10 @@ export function webRoutes(reads: ReadModel): Hono {
       const tag = c.req.query('tag') || undefined;
       const posts = reads.sessionPosts(sessionId, { tag, cursor: c.req.query('cursor'), limit: PAGE_SIZE });
       const replies = reads.replyContext(posts.items.flatMap((p) => (p.reply_to_post_id ? [p.reply_to_post_id] : [])));
-      return sessionPage({ ...detail, posts: posts.items, replies, nextCursor: posts.next_cursor, tag });
+      return sessionPage({
+        ...detail, posts: posts.items, replies, nextCursor: posts.next_cursor, tag,
+        watermark: posts.watermark, refreshCursor: posts.refresh_cursor, startsAtBeginning: posts.starts_at_beginning,
+      });
     });
 
   web.get('/', (c) => {
@@ -65,17 +68,21 @@ export function webRoutes(reads: ReadModel): Hono {
 
   web.get('/threads/:id', (c) =>
     orNotFound(c, () => {
-      const data = reads.threadPosts(c.req.param('id'), c.req.query('cursor'), PAGE_SIZE);
+      const data = reads.threadPosts(c.req.param('id'), { cursor: c.req.query('cursor'), limit: PAGE_SIZE, at: c.req.query('at') });
       const replies = reads.replyContext(data.items.flatMap((p) => (p.reply_to_post_id ? [p.reply_to_post_id] : [])));
-      return threadPage({ thread: data.thread, session: data.session, posts: data.items, replies, nextCursor: data.next_cursor });
+      return threadPage({
+        thread: data.thread, session: data.session, posts: data.items, replies,
+        nextCursor: data.next_cursor, startsAtBeginning: data.starts_at_beginning,
+      });
     }),
   );
 
-  // Stable post reference: redirects to the post's place in its thread.
+  // Stable post reference: opens the thread page at the post, on any page.
   web.get('/posts/:id', (c) => {
-    const loc = reads.postLocation(c.req.param('id'));
+    const id = c.req.param('id');
+    const loc = reads.postLocation(id);
     if (!loc) return page(c, notFoundPage(), 404);
-    return c.redirect(`/threads/${loc.thread_id}#post-${c.req.param('id')}`, 302);
+    return c.redirect(`/threads/${loc.thread_id}?at=${encodeURIComponent(id)}#post-${id}`, 302);
   });
 
   web.get('/archive', (c) =>

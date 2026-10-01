@@ -1,12 +1,31 @@
 // Progressive enhancements only; every page works without this script.
-(function () {
+(function (root) {
   'use strict';
 
+  /**
+   * What a page watching one session should do with a status response.
+   * The page polls the session it shows, never "whatever is current", so a
+   * new session opening elsewhere cannot keep an old tab polling forever.
+   * Returns 'retry' | 'stop' | 'closed' | 'new' | 'none'.
+   */
+  function decidePoll(observedSessionId, seenSeq, response) {
+    if (!response) return 'retry';
+    if (response.notFound) return 'stop';
+    var s = response.session;
+    if (!s || s.id !== observedSessionId) return 'stop';
+    if (s.state !== 'open') return 'closed';
+    var latest = response.stats ? response.stats.latest_post_seq : 0;
+    return latest > seenSeq ? 'new' : 'none';
+  }
+
+  root.SalonNocturne = { decidePoll: decidePoll };
+  if (typeof document === 'undefined') return;
+
   // Read mode: hide the scene and widen the text column. Remembered per browser.
-  var KEY = 'salon.readMode';
+  var READ_KEY = 'salon.readMode';
   var button = document.querySelector('[data-read-mode]');
   function storedReadMode() {
-    try { return localStorage.getItem(KEY) === '1'; } catch (e) { return false; }
+    try { return localStorage.getItem(READ_KEY) === '1'; } catch (e) { return false; }
   }
   function applyReadMode(on) {
     document.body.classList.toggle('read-mode', on);
@@ -17,7 +36,7 @@
     button.addEventListener('click', function () {
       var on = !document.body.classList.contains('read-mode');
       applyReadMode(on);
-      try { localStorage.setItem(KEY, on ? '1' : '0'); } catch (e) { /* storage unavailable */ }
+      try { localStorage.setItem(READ_KEY, on ? '1' : '0'); } catch (e) { /* storage unavailable */ }
     });
   }
 
@@ -36,35 +55,59 @@
     });
   }
 
-  // New-post notice. Polls public status at a modest interval only while the
-  // session is open and the tab is visible; it never scrolls the page.
+  // After "show new thoughts", put the reader back where they were reading.
+  var SCROLL_KEY = 'salon.restoreScroll';
+  try {
+    var saved = JSON.parse(sessionStorage.getItem(SCROLL_KEY) || 'null');
+    sessionStorage.removeItem(SCROLL_KEY);
+    if (saved && saved.url === location.pathname + location.search) {
+      window.scrollTo({ top: saved.y, left: 0, behavior: 'instant' });
+    }
+  } catch (e) { /* storage unavailable */ }
+
+  // New-post notice. Polls this page's own session at a modest interval while
+  // it is open and the tab is visible; it never scrolls the page.
   var notice = document.querySelector('[data-new-thoughts]');
   if (!notice) return;
   var sessionId = notice.getAttribute('data-session-id');
-  var seen = Number(notice.getAttribute('data-latest-seq')) || 0;
-  var stopped = false;
+  var seen = Number(notice.getAttribute('data-seen-seq')) || 0;
+  var refreshUrl = notice.getAttribute('data-refresh-url');
   var noticeButton = notice.querySelector('button');
-  noticeButton.addEventListener('click', function () { window.location.reload(); });
+  var timer = null;
+
+  function stop() {
+    if (timer) clearInterval(timer);
+    timer = null;
+  }
+
+  noticeButton.addEventListener('click', function () {
+    try {
+      sessionStorage.setItem(SCROLL_KEY, JSON.stringify({ url: refreshUrl, y: window.scrollY }));
+    } catch (e) { /* storage unavailable */ }
+    window.location.assign(refreshUrl);
+  });
 
   function check() {
-    if (stopped || document.hidden) return;
-    fetch('/api/v1/sessions/current', { headers: { Accept: 'application/json' } })
-      .then(function (r) { return r.ok ? r.json() : null; })
+    if (document.hidden) return;
+    fetch('/api/v1/sessions/' + encodeURIComponent(sessionId) + '/status', { headers: { Accept: 'application/json' } })
+      .then(function (r) {
+        if (r.status === 404) return { notFound: true };
+        return r.ok ? r.json() : null;
+      })
+      .catch(function () { return null; })
       .then(function (data) {
-        if (!data || !data.session || data.session.id !== sessionId) return;
-        if (data.session.state !== 'open') {
-          stopped = true;
+        var action = decidePoll(sessionId, seen, data);
+        if (action === 'stop') {
+          stop();
+        } else if (action === 'closed') {
+          stop();
           noticeButton.textContent = 'This session has closed · refresh';
           notice.hidden = false;
-          return;
-        }
-        var latest = data.stats ? data.stats.latest_seq : 0;
-        if (latest > seen) {
+        } else if (action === 'new') {
           noticeButton.textContent = 'New thoughts have arrived · show them';
           notice.hidden = false;
         }
-      })
-      .catch(function () { /* transient; try again later */ });
+      });
   }
-  var timer = setInterval(function () { if (stopped) clearInterval(timer); else check(); }, 20000);
-})();
+  timer = setInterval(check, 20000);
+})(typeof window !== 'undefined' ? window : globalThis);

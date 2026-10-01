@@ -46,7 +46,7 @@ test('pages render real, escaped conversation text with security headers', async
 
   const link = await call('GET', `/posts/${opener.id}`);
   assert.equal(link.status, 302);
-  assert.equal(link.res.headers.get('location'), `/threads/${thread.id}#post-${opener.id}`);
+  assert.equal(link.res.headers.get('location'), `/threads/${thread.id}?at=${opener.id}#post-${opener.id}`);
 
   const search = await call('GET', `/search?q=${encodeURIComponent('建築')}`);
   assert.ok((search.body as string).includes('<mark>建築</mark>'));

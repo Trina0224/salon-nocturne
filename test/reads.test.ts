@@ -82,7 +82,13 @@ test('cursors are validated, scoped, and stable while new posts arrive', async (
   const p2 = await call('GET', `/api/v1/threads/${thread.id}/posts?limit=3&cursor=${encodeURIComponent(p1.body.next_cursor)}`);
   const bodies = [...p1.body.items, ...p2.body.items].map((p: { body: string }) => p.body);
   assert.deepEqual(bodies, ['Opening thought.', 'Item 0', 'Item 1', 'Item 2', 'Item 3', 'Item 4']);
-  assert.equal(p2.body.has_more, false);
+  // The snapshot is exhausted, but a newer post exists: the listing continues
+  // into a fresh snapshot instead of ending, with no gap or duplicate.
+  assert.equal(p2.body.has_more, true);
+  const p3 = await call('GET', `/api/v1/threads/${thread.id}/posts?limit=3&cursor=${encodeURIComponent(p2.body.next_cursor)}`);
+  assert.deepEqual(p3.body.items.map((p: { body: string }) => p.body), ['Arrived mid-pagination']);
+  assert.equal(p3.body.has_more, false);
+  assert.equal(p3.body.next_cursor, null);
 
   const bad = await call('GET', `/api/v1/threads/${thread.id}/posts?cursor=garbage`);
   assert.equal(bad.status, 400);
