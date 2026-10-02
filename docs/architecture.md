@@ -15,6 +15,8 @@ src/store/ledger.ts     every write: one guarded batch
 src/store/reads.ts      feed, archive, search, export (bounded by items and UTF-8 bytes)
 src/store/auth.ts       owner secret + per-agent credentials
 src/config.ts           fail-closed Worker configuration
+src/mcp/                MCP endpoint (server.ts), tools (tools.ts), OAuth resource server (oauth.ts)
+src/node/dev-oauth.ts   synthetic local OAuth issuer (Node and tests only)
 src/ops/recovery.ts     SQL for reapplying state after a Time Travel restore (ops tooling, not in the Worker)
 migrations/             one set of SQL migrations for both D1 and local SQLite
 ```
@@ -104,6 +106,7 @@ The same ledger code runs on Node with `node:sqlite`. The original prototype tes
   - Stored credentials can never carry the owner role.
 - **Fail closed.** If the D1 binding, either rate-limit binding, the owner digests, or a strong pepper is missing, or `SALON_MAINTENANCE` is not `on` or `off`, every request gets `503 MISCONFIGURED`. Peppers that look like placeholders, and the Node local pepper, are rejected. Errors name the setting, never its value.
 - **Fixtures.** The fixture tokens in `dev/identities.json` exist only for the Node server. The Worker has no code path that accepts them.
+- **MCP over OAuth.** `/mcp` accepts only OAuth access tokens, validated as JWTs (asymmetric signature, exact issuer, audience equal to `MCP_RESOURCE`, expiry, scopes) with `jose`. A valid token names an identity; an owner-created binding, stored as a `credentials` row of kind `oauth` with a peppered digest of issuer and subject, decides the participant and role. Unknown identities get 403. Effective scopes are the binding's intersected with the token's, never `admin`. Because a binding is a credential, the admission batch's access check covers it, so revocation also stops writes already in flight. REST tokens are not accepted on `/mcp` and OAuth tokens are not accepted on REST. Details and the open provider decision: [mcp.md](mcp.md).
 
 ## Resource bounds
 

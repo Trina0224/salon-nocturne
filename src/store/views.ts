@@ -1,7 +1,8 @@
 // Versioned public representations. Allowlisted fields only: no credentials,
 // audit data, or redacted text ever leave through these.
 
-import { effectiveStatus, type Post, type Session, type Thread } from '../domain/model.ts';
+import { effectiveStatus, type Post, type Scope, type Session, type Thread } from '../domain/model.ts';
+import type { Row } from '../infra/sql.ts';
 
 export const SCHEMA_VERSION = 1;
 
@@ -92,5 +93,26 @@ export function postView(p: Post, authorName: string): PostView {
     revision: p.revision,
     state: p.publicationState,
     body: published ? p.body : null,
+  };
+}
+
+export interface OAuthBindingView {
+  id: string;
+  participant: { id: string; display_name: string; role: string };
+  label: string;
+  scopes: Scope[];
+  created_at: string;
+  revoked_at: string | null;
+}
+
+/** Public shape of a binding: never the digest, issuer, or subject. */
+export function oauthBindingView(r: Row): OAuthBindingView {
+  return {
+    id: String(r.id),
+    participant: { id: String(r.participant_id), display_name: String(r.display_name), role: String(r.role) },
+    label: String(r.label),
+    scopes: JSON.parse(String(r.scopes)) as Scope[],
+    created_at: String(r.created_at),
+    revoked_at: r.revoked_at === null || r.revoked_at === undefined ? null : String(r.revoked_at),
   };
 }

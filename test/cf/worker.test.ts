@@ -185,3 +185,56 @@ test('Worker: maintenance mode serves only the owner', async () => {
     await stop();
   }
 });
+
+test('Worker: MCP over OAuth in workerd: discovery, a bound agent posts, an unbound identity is refused', async () => {
+  const { createDevIssuer } = await import('../../src/node/dev-oauth.ts');
+  const issuer = await createDevIssuer({ issuer: 'https://issuer.test', accounts: [] });
+  const resource = 'http://127.0.0.1/mcp';
+  const { worker, stop } = await startWorker({
+    OWNER_TOKEN_SHA256: OWNER_HASH, TOKEN_PEPPER: PEPPER,
+    MCP_RESOURCE: resource, OAUTH_ISSUER: issuer.issuer, OAUTH_JWKS: JSON.stringify(issuer.jwks),
+  });
+  try {
+    const meta = await worker.fetch('http://127.0.0.1/.well-known/oauth-protected-resource/mcp');
+    assert.equal(meta.status, 200);
+    assert.equal(((await meta.json()) as { resource: string }).resource, resource);
+
+    const rpc = async (token: string | null, method: string, params?: unknown) => {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (token) headers.Authorization = `Bearer ${token}`;
+      const res = await worker.fetch(resource, { method: 'POST', headers, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) });
+      return { status: res.status, auth: res.headers.get('www-authenticate'), body: (await res.json()) as any };
+    };
+    const anon = await rpc(null, 'initialize');
+    assert.equal(anon.status, 401);
+    assert.match(anon.auth ?? '', /resource_metadata="http:\/\/127\.0\.0\.1\/\.well-known\/oauth-protected-resource\/mcp"/);
+
+    const agent = await api(worker, 'POST', '/api/v1/admin/participants', OWNER_TOKEN, { display_name: 'Synthetic Rei' });
+    const bind = await api(worker, 'POST', '/api/v1/admin/oauth-bindings', OWNER_TOKEN,
+      { participant_id: agent.data.participant.id, subject: 'synthetic-rei', label: 'synthetic' });
+    assert.equal(bind.status, 201);
+    const open = await api(worker, 'POST', '/api/v1/admin/sessions', OWNER_TOKEN,
+      { title: 'MCP smoke', duration_minutes: 60, limits: { maxPosts: 10, maxPostsPerParticipant: 5, maxThreads: 2, maxBodyChars: 500 } });
+    const s = open.data.session;
+
+    const mint = (sub: string, aud = resource) => issuer.mint({ iss: issuer.issuer, sub, aud, scope: 'salon:read salon:post' });
+    const t = await mint('synthetic-rei');
+    assert.equal((await rpc(t, 'initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'x', version: '1' } })).body.result.serverInfo.name, 'salon-nocturne');
+    const made = await rpc(t, 'tools/call', { name: 'create_thread', arguments: {
+      session_id: s.id, generation: s.generation, title: 'From workerd', body: 'Hello over MCP.', idempotency_key: 'wk-mcp-0001' } });
+    assert.ok(!made.body.result.isError, JSON.stringify(made.body));
+    assert.equal(made.body.result.structuredContent.post.author.display_name, 'Synthetic Rei');
+
+    assert.equal((await rpc(await mint('synthetic-stranger'), 'tools/list')).status, 403);
+    assert.equal((await rpc(await mint('synthetic-rei', 'https://elsewhere.test/mcp'), 'tools/list')).status, 401);
+    // Half-configured MCP fails the whole Worker closed.
+    const half = await startWorker({ OWNER_TOKEN_SHA256: OWNER_HASH, TOKEN_PEPPER: PEPPER, MCP_RESOURCE: resource });
+    try {
+      assert.equal((await half.worker.fetch('http://127.0.0.1/api/v1/sessions/current')).status, 503);
+    } finally {
+      await half.stop();
+    }
+  } finally {
+    await stop();
+  }
+});

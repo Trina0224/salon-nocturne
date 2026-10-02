@@ -23,8 +23,8 @@ import {
 } from '../domain/content.ts';
 import { HARD_CAPS, toIso, type Actor, type Scope, type WriteOperation } from '../domain/model.ts';
 import { displayNames, loadPost, loadSession, loadThread, postFromRow } from './rows.ts';
-import { AGENT_SCOPES, accessStillValidSql, isAccessValid, type Authenticator } from './auth.ts';
-import { postView, sessionView, threadView, type PostView, type SessionView, type ThreadView } from './views.ts';
+import { AGENT_SCOPES, OAUTH_BINDING_SCOPES, accessStillValidSql, isAccessValid, type Authenticator } from './auth.ts';
+import { oauthBindingView, postView, sessionView, threadView, type OAuthBindingView, type PostView, type SessionView, type ThreadView } from './views.ts';
 
 export interface LedgerHooks {
   /** Test seam: runs just before the admission batch is sent. */
@@ -427,6 +427,55 @@ export class Ledger {
     ]);
     const r = await this.db.first('SELECT revoked_at FROM credentials WHERE id = ?', credentialId);
     return { status: 200, value: { id: credentialId, revoked_at: String(r!.revoked_at) } };
+  }
+
+  /**
+   * Binds a validated OAuth identity (issuer + subject) to one participant for
+   * the MCP endpoint. Only the owner can bind, through the REST owner API.
+   * Binding to the owner participant needs an explicit confirm_owner: true.
+   * The identity is stored only as a keyed digest and is never echoed back.
+   */
+  async bindOAuthIdentity(actor: Actor, issuer: string, raw: Body): Promise<{ binding: OAuthBindingView }> {
+    this.requireOwner(actor);
+    rejectFields(raw, ['issuer', 'scopes', 'role']);
+    const participantId = validateTitle(raw.participant_id, 'participant_id', 64);
+    const subject = validateTitle(raw.subject, 'subject', 255);
+    const label = validateTitle(raw.label, 'label', 60);
+    const confirmOwner = raw.confirm_owner === undefined ? false : raw.confirm_owner;
+    if (typeof confirmOwner !== 'boolean') throw invalid('confirm_owner must be a boolean.');
+    const target = await this.db.first('SELECT role FROM participants WHERE id = ?', participantId);
+    if (!target) throw notFound('Participant');
+    if (target.role === 'owner' && !confirmOwner) {
+      throw invalid('Binding an identity to the owner gives it host posting rights. Repeat with "confirm_owner": true if that is intended.');
+    }
+    const digest = await this.auth.oauthIdentityDigest(issuer, subject);
+    const bindingId = newId('cred');
+    const gid = newId('adm');
+    const now = this.clock.sqlNow();
+    try {
+      await this.admit('Participant', [
+        new Query()
+          .add(`INSERT INTO admissions (id, at, seq, session_id, reason)
+                SELECT ?, n.at, 0, NULL, CASE WHEN p.id IS NULL THEN 'NOT_FOUND'
+                                              WHEN p.status = 'revoked' THEN 'PARTICIPANT_REVOKED' END`, gid)
+          .add(`FROM (SELECT ${now.sql} AS at) n LEFT JOIN participants p ON p.id = ?`, ...now.params, participantId)
+          .build(),
+        stmt(`INSERT INTO credentials (id, participant_id, token_digest, scopes, label, created_at, kind)
+              SELECT ?, ?, ?, ?, ?, at, 'oauth' FROM admissions WHERE id = ?`,
+          bindingId, participantId, digest, JSON.stringify(OAUTH_BINDING_SCOPES), label, gid),
+        this.auditStmt(gid, actor, 'bind_oauth_identity', 'participant', participantId, label),
+        this.clearStmt(gid),
+      ]);
+    } catch (err) {
+      if (isUniqueViolation(err, 'credentials')) {
+        throw new ApiError(409, 'IDENTITY_ALREADY_BOUND', 'This identity is already bound. Revoke the existing binding first.');
+      }
+      throw err;
+    }
+    const r = await this.db.first(
+      `SELECT c.id, c.participant_id, c.label, c.scopes, c.created_at, c.revoked_at, p.display_name, p.role
+       FROM credentials c JOIN participants p ON p.id = c.participant_id WHERE c.id = ?`, bindingId);
+    return { binding: oauthBindingView(r!) };
   }
 
   // ---- admission internals --------------------------------------------------

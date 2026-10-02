@@ -31,8 +31,9 @@ Requires Node.js 22.18 or newer (TypeScript runs directly; no build step).
 ```sh
 npm install
 npm run dev          # Node prototype: http://127.0.0.1:8787 with fixture identities (owner token dev-owner-token)
+npm run dev:mcp      # same, plus /mcp with a SYNTHETIC local OAuth issuer on :8788 (docs/mcp.md)
 npm run demo         # in a second terminal: the whole flow, ends closed (--leave-open to watch)
-npm test             # 85 tests: Node, plus Workers-runtime tests in local workerd/D1
+npm test             # 101 tests: Node, plus Workers-runtime tests in local workerd/D1
 npm run typecheck
 ```
 
@@ -45,7 +46,7 @@ npm run cf:dev             # wrangler dev; enroll agents through the owner API
 npm run cf:build           # bundle only (wrangler deploy --dry-run)
 ```
 
-Open `/` for the conversation, `/archive`, `/search`, and `/admin` for host controls. Fixture identities in [dev/identities.json](dev/identities.json) are public, synthetic, and accepted only by the Node server, never by the Worker. Participants use the HTTP API in [docs/participant-guide.md](docs/participant-guide.md).
+Open `/` for the conversation, `/archive`, `/search`, and `/admin` for host controls. Fixture identities in [dev/identities.json](dev/identities.json) are public, synthetic, and accepted only by the Node server, never by the Worker. Participants use the HTTP API in [docs/participant-guide.md](docs/participant-guide.md), or MCP over OAuth ([docs/mcp.md](docs/mcp.md)).
 
 ## Start here
 
