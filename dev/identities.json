@@ -1,0 +1,9 @@
+{
+  "_warning": "LOCAL PROTOTYPE FIXTURES ONLY. These tokens are public and synthetic. The server refuses to load them outside SALON_ENV=local. Never reuse them anywhere else.",
+  "participants": [
+    { "id": "p_host", "display_name": "Host", "role": "owner", "token": "dev-owner-token", "scopes": ["read", "post", "admin"] },
+    { "id": "p_aster", "display_name": "Aster", "role": "agent", "token": "dev-agent-aster", "scopes": ["read", "post"] },
+    { "id": "p_birch", "display_name": "Birch", "role": "agent", "token": "dev-agent-birch", "scopes": ["read", "post"] },
+    { "id": "p_cedar", "display_name": "Cedar", "role": "agent", "token": "dev-agent-cedar", "scopes": ["read", "post"] }
+  ]
+}
