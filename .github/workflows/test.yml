@@ -1,0 +1,30 @@
+# Test-only CI: typecheck, Node tests, and Workers-runtime tests in local
+# workerd/D1. Needs no secrets or Cloudflare access and never deploys.
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CI: 'true'
+      WRANGLER_SEND_METRICS: 'false'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run test:node
+      - run: npm run test:workers
+      - run: npm run cf:build

@@ -1,9 +1,7 @@
 // Row loaders shared by the write ledger and read model.
 
-import type { Db } from '../infra/db.ts';
+import type { Row, SqlDb } from '../infra/sql.ts';
 import type { Post, Session, Thread } from '../domain/model.ts';
-
-type Row = Record<string, unknown>;
 
 const str = (v: unknown) => v as string;
 const num = (v: unknown) => Number(v);
@@ -59,27 +57,33 @@ export function postFromRow(r: Row): Post {
   };
 }
 
-export function loadSession(db: Db, id: string): Session | null {
-  const r = db.prepare('SELECT * FROM sessions WHERE id = ?').get(id);
+export async function loadSession(db: SqlDb, id: string): Promise<Session | null> {
+  const r = await db.first('SELECT * FROM sessions WHERE id = ?', id);
   return r ? sessionFromRow(r) : null;
 }
 
-export function loadThread(db: Db, id: string): Thread | null {
-  const r = db.prepare('SELECT * FROM threads WHERE id = ?').get(id);
+export async function loadThread(db: SqlDb, id: string): Promise<Thread | null> {
+  const r = await db.first('SELECT * FROM threads WHERE id = ?', id);
   return r ? threadFromRow(r) : null;
 }
 
-export function loadPost(db: Db, id: string): Post | null {
-  const r = db.prepare('SELECT * FROM posts WHERE id = ?').get(id);
+export async function loadPost(db: SqlDb, id: string): Promise<Post | null> {
+  const r = await db.first('SELECT * FROM posts WHERE id = ?', id);
   return r ? postFromRow(r) : null;
 }
 
-export function displayNames(db: Db, ids: Iterable<string>): Map<string, string> {
+/** Display names for participant IDs, in chunks below D1's bound-parameter limit. */
+export async function displayNames(db: SqlDb, ids: Iterable<string>): Promise<Map<string, string>> {
+  const unique = [...new Set(ids)];
   const names = new Map<string, string>();
-  const stmt = db.prepare('SELECT display_name FROM participants WHERE id = ?');
-  for (const id of new Set(ids)) {
-    const r = stmt.get(id);
-    names.set(id, r ? String(r.display_name) : 'Unknown');
+  for (let i = 0; i < unique.length; i += 90) {
+    const chunk = unique.slice(i, i + 90);
+    const rows = await db.all(
+      `SELECT id, display_name FROM participants WHERE id IN (${chunk.map(() => '?').join(', ')})`,
+      ...chunk,
+    );
+    for (const r of rows) names.set(String(r.id), String(r.display_name));
   }
+  for (const id of unique) if (!names.has(id)) names.set(id, 'Unknown');
   return names;
 }

@@ -18,18 +18,24 @@ export type ErrorCode =
   | 'REVISION_CONFLICT'
   | 'TOO_LARGE'
   | 'QUOTA_EXHAUSTED'
+  | 'RATE_LIMITED'
+  | 'MISCONFIGURED'
+  | 'MAINTENANCE'
   | 'INTERNAL';
 
 export class ApiError extends Error {
   readonly status: number;
   readonly code: ErrorCode;
   readonly stop: boolean;
+  /** Seconds to wait before retrying, sent as Retry-After. */
+  readonly retryAfter: number | null;
 
-  constructor(status: number, code: ErrorCode, message: string, stop = false) {
+  constructor(status: number, code: ErrorCode, message: string, stop = false, retryAfter: number | null = null) {
     super(message);
     this.status = status;
     this.code = code;
     this.stop = stop;
+    this.retryAfter = retryAfter;
   }
 }
 
@@ -38,3 +44,6 @@ export const notFound = (what = 'Resource') => new ApiError(404, 'NOT_FOUND', `$
 export const forbidden = (message = 'Not permitted.') => new ApiError(403, 'FORBIDDEN', message);
 export const sessionClosed = () =>
   new ApiError(409, 'SESSION_CLOSED', 'The session is closed. Stop posting and polling for it.', true);
+
+export const rateLimited = (what: string) =>
+  new ApiError(429, 'RATE_LIMITED', `Too many ${what}. Wait a minute before trying again.`, false, 60);

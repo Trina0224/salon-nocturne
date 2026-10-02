@@ -36,7 +36,7 @@ test('authors cannot be spoofed: identity comes only from the credential', async
 });
 
 test('an Idempotency-Key is required and replays never write twice', async () => {
-  const { openSession, startThread, post, call, salon } = setup();
+  const { openSession, startThread, post, call, raw } = setup();
   const s = await openSession();
   const { thread } = await startThread(s.id, s.generation);
   const missing = await call('POST', `/api/v1/threads/${thread.id}/posts`, {
@@ -50,7 +50,7 @@ test('an Idempotency-Key is required and replays never write twice', async () =>
   assert.equal(again.status, 200);
   assert.equal(again.body.replayed, true);
   assert.equal(again.body.post.id, first.body.post.id);
-  const usage = salon.db.prepare('SELECT posts_used FROM sessions WHERE id = ?').get(s.id)!;
+  const usage = raw.prepare('SELECT posts_used FROM sessions WHERE id = ?').get(s.id)!;
   assert.equal(Number(usage.posts_used), 2, 'thread opener + one post; the replay is not charged');
 
   const conflict = await post(thread.id, s, TOKENS.birch, 'Different text.', {}, 'birch-key-0001');
@@ -171,7 +171,7 @@ test('trusted time is read at final admission, not at request arrival', async ()
 });
 
 test('close and post have one order: close-first rejects, post-first is kept', async () => {
-  const { openSession, startThread, post, call, salon } = setup();
+  const { openSession, startThread, post, call, raw } = setup();
   const s = await openSession();
   const { thread } = await startThread(s.id, s.generation);
   const kept = await post(thread.id, s, TOKENS.birch, 'Admitted before the close.');
@@ -181,8 +181,8 @@ test('close and post have one order: close-first rejects, post-first is kept', a
   assert.equal(rejected.body.error.code, 'SESSION_CLOSED');
   const page = await call('GET', `/api/v1/threads/${thread.id}/posts`);
   assert.deepEqual(page.body.items.map((p: { body: string }) => p.body), ['Opening thought.', 'Admitted before the close.']);
-  const closeSeq = Number(salon.db.prepare("SELECT MAX(seq) AS s FROM changes WHERE resource_type = 'session'").get()!.s);
-  const maxPostSeq = Number(salon.db.prepare('SELECT MAX(seq) AS s FROM posts').get()!.s);
+  const closeSeq = Number(raw.prepare("SELECT MAX(seq) AS s FROM changes WHERE resource_type = 'session'").get()!.s);
+  const maxPostSeq = Number(raw.prepare('SELECT MAX(seq) AS s FROM posts').get()!.s);
   assert.ok(maxPostSeq < closeSeq, 'every admitted post precedes the close in committed order');
 });
 

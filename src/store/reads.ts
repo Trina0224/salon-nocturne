@@ -1,14 +1,16 @@
 // The read side: public archive, participant change feed, search, export.
-// Every listing is bounded and paginated by the committed change sequence.
+// Every listing is bounded by item count and UTF-8 bytes and paginated by the
+// committed change sequence. Queries join display names in the database to
+// keep D1 round trips and rows read low.
 
-import type { Db } from '../infra/db.ts';
+import type { SqlDb, SqlValue, Row } from '../infra/sql.ts';
 import type { Clock } from '../infra/clock.ts';
 import { CursorCodec, type CursorState } from '../infra/cursor.ts';
-import { sha256 } from '../infra/ids.ts';
+import { sha256Hex, utf8Length } from '../infra/crypto.ts';
 import { ApiError, invalid, notFound } from '../domain/errors.ts';
 import { codePoints } from '../domain/content.ts';
-import { effectiveStatus, toIso, type Actor, type Post, type Session } from '../domain/model.ts';
-import { displayNames, loadPost, loadSession, loadThread, postFromRow, sessionFromRow, threadFromRow } from './rows.ts';
+import { effectiveStatus, toIso, type Actor, type Session } from '../domain/model.ts';
+import { loadPost, loadSession, loadThread, postFromRow, sessionFromRow, threadFromRow } from './rows.ts';
 import { postView, sessionView, threadView, type PostView, type SessionView, type ThreadView } from './views.ts';
 
 export const DEFAULT_LIMIT = 50;
@@ -23,6 +25,14 @@ const AT_CONTEXT = 3;
 const MAX_EXPORT_POSTS = 5000;
 const MAX_QUERY_CHARS = 100;
 const MAX_QUERY_TERMS = 5;
+// One- and two-character terms cannot use the trigram index; they scan only
+// this many of the most recent change sequences to bound rows read.
+export const SHORT_TERM_SEQ_WINDOW = 50_000;
+
+export interface ReadLimits {
+  /** Largest export, in UTF-8 bytes of the JSON document. */
+  exportByteCap: number;
+}
 
 export function parseLimit(raw: string | undefined): number {
   if (raw === undefined || raw === '') return DEFAULT_LIMIT;
@@ -46,7 +56,7 @@ export interface PostPage extends Page<PostView & { thread_title: string }> {
   starts_at_beginning: boolean;
 }
 
-export const utf8Bytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value), 'utf8');
+export const utf8Bytes = (value: unknown) => utf8Length(JSON.stringify(value));
 
 /**
  * Keeps items in order while the whole response, envelope included, stays
@@ -86,87 +96,95 @@ export interface SearchHit {
   url: string;
 }
 
+const placeholders = (n: number) => Array.from({ length: n }, () => '?').join(', ');
+
+/** Builds a post view from a row that also carries `author_name`. */
+function postViewFromRow(r: Row): PostView {
+  return postView(postFromRow(r), String(r.author_name ?? 'Unknown'));
+}
+
 export class ReadModel {
-  readonly db: Db;
+  readonly db: SqlDb;
   readonly clock: Clock;
   readonly cursors: CursorCodec;
+  readonly limits: ReadLimits;
 
-  constructor(db: Db, clock: Clock, cursors: CursorCodec) {
+  constructor(db: SqlDb, clock: Clock, cursors: CursorCodec, limits: ReadLimits) {
     this.db = db;
     this.clock = clock;
     this.cursors = cursors;
+    this.limits = limits;
   }
 
   // ---- public status and archive -------------------------------------------
 
   /** The latest session (open or not). Never cached past a transition. */
-  currentSession(): { session: SessionView | null; stats: SessionStats | null; server_now: string } {
+  async currentSession(): Promise<{ session: SessionView | null; stats: SessionStats | null; server_now: string }> {
     const nowMs = this.clock.now();
-    const r = this.db.prepare('SELECT * FROM sessions ORDER BY generation DESC LIMIT 1').get();
+    const r = await this.db.first('SELECT * FROM sessions ORDER BY generation DESC LIMIT 1');
     if (!r) return { session: null, stats: null, server_now: toIso(nowMs) };
     const s = sessionFromRow(r);
-    return { session: sessionView(s, nowMs), stats: this.stats(s.id), server_now: toIso(nowMs) };
+    return { session: sessionView(s, nowMs), stats: await this.stats(s.id), server_now: toIso(nowMs) };
   }
 
-  listSessions(cursorRaw: string | undefined, limit: number): Page<SessionView & { stats: SessionStats }> {
+  async listSessions(cursorRaw: string | undefined, limit: number): Promise<Page<SessionView & { stats: SessionStats }>> {
     const nowMs = this.clock.now();
     const scope = 'sessions';
-    const cur = this.cursors.decode(cursorRaw, scope, nowMs);
+    const cur = await this.cursors.decode(cursorRaw, scope, nowMs);
     const before = cur ? cur.after : Number.MAX_SAFE_INTEGER;
-    const rows = this.db
-      .prepare('SELECT * FROM sessions WHERE generation < ? ORDER BY generation DESC LIMIT ?')
-      .all(before, limit + 1)
+    const rows = (await this.db.all('SELECT * FROM sessions WHERE generation < ? ORDER BY generation DESC LIMIT ?', before, limit + 1))
       .map(sessionFromRow);
-    const fit = fitToBudget({ items: [] }, rows.slice(0, limit).map((s) => ({ ...sessionView(s, nowMs), stats: this.stats(s.id) })));
-    const items = fit.kept;
+    const page = rows.slice(0, limit);
+    // Two queries for the whole page, never one per session.
+    const stats = await this.statsMany(page.map((s) => s.id));
+    const views = page.map((s) => ({ ...sessionView(s, nowMs), stats: stats.get(s.id)! }));
+    const fit = fitToBudget({ items: [] }, views);
     const more = fit.truncated || rows.length > limit;
-    const last = items.at(-1);
+    const last = fit.kept.at(-1);
     return {
-      items,
+      items: fit.kept,
       has_more: more,
-      next_cursor: more && last ? this.cursors.encode({ scope, after: last.generation, watermark: 0 }, nowMs) : null,
+      next_cursor: more && last ? await this.cursors.encode({ scope, after: last.generation, watermark: 0 }, nowMs) : null,
     };
   }
 
-  sessionDetail(id: string): { session: SessionView; stats: SessionStats; threads: (ThreadView & { post_count: number })[] } {
+  async sessionDetail(id: string): Promise<{ session: SessionView; stats: SessionStats; threads: (ThreadView & { post_count: number })[] }> {
     const nowMs = this.clock.now();
-    const s = loadSession(this.db, id);
+    const s = await loadSession(this.db, id);
     if (!s) throw notFound('Session');
-    const threads = this.db
-      .prepare(
-        `SELECT t.*, (SELECT COUNT(*) FROM posts p WHERE p.thread_id = t.id) AS post_count
-         FROM threads t WHERE t.session_id = ? ORDER BY t.seq LIMIT 200`,
-      )
-      .all(id)
-      .map((r) => ({ ...threadView(threadFromRow(r)), post_count: Number(r.post_count) }));
-    return { session: sessionView(s, nowMs), stats: this.stats(id), threads };
+    const threads = (await this.db.all(
+      `SELECT t.*, (SELECT COUNT(*) FROM posts p WHERE p.thread_id = t.id) AS post_count
+       FROM threads t WHERE t.session_id = ? ORDER BY t.seq LIMIT 200`,
+      id,
+    )).map((r) => ({ ...threadView(threadFromRow(r)), post_count: Number(r.post_count) }));
+    return { session: sessionView(s, nowMs), stats: await this.stats(id), threads };
   }
 
   /** Lightweight public status of one specific session, for pages watching it. */
-  sessionStatus(id: string): { session: SessionView; stats: SessionStats; server_now: string } {
+  async sessionStatus(id: string): Promise<{ session: SessionView; stats: SessionStats; server_now: string }> {
     const nowMs = this.clock.now();
-    const s = loadSession(this.db, id);
+    const s = await loadSession(this.db, id);
     if (!s) throw notFound('Session');
-    return { session: sessionView(s, nowMs), stats: this.stats(id), server_now: toIso(nowMs) };
+    return { session: sessionView(s, nowMs), stats: await this.stats(id), server_now: toIso(nowMs) };
   }
 
   /** All posts of a session in chronological order, optionally by thread tag. */
-  sessionPosts(sessionId: string, opts: { tag?: string; cursor?: string; limit: number }): PostPage {
-    if (!loadSession(this.db, sessionId)) throw notFound('Session');
+  async sessionPosts(sessionId: string, opts: { tag?: string; cursor?: string; limit: number }): Promise<PostPage> {
+    if (!(await loadSession(this.db, sessionId))) throw notFound('Session');
     const tag = opts.tag?.trim().toLowerCase() || undefined;
     const scope = `session-posts:${sessionId}:${tag ?? ''}`;
     return this.ascendingPosts(scope, opts.cursor, opts.limit, { items: [] }, 0, (after, watermark, take) => {
       const tagClause = tag ? 'AND EXISTS (SELECT 1 FROM json_each(t.tags) WHERE value = ?)' : '';
-      const params: (string | number)[] = [sessionId, after, watermark];
+      const params: SqlValue[] = [sessionId, after, watermark];
       if (tag) params.push(tag);
       params.push(take);
-      return this.db
-        .prepare(
-          `SELECT p.*, t.title AS thread_title FROM posts p JOIN threads t ON t.id = p.thread_id
-           WHERE p.session_id = ? AND p.seq > ? AND p.seq <= ? ${tagClause}
-           ORDER BY p.seq LIMIT ?`,
-        )
-        .all(...params);
+      return this.db.all(
+        `SELECT p.*, t.title AS thread_title, pa.display_name AS author_name
+         FROM posts p JOIN threads t ON t.id = p.thread_id JOIN participants pa ON pa.id = p.author_id
+         WHERE p.session_id = ? AND p.seq > ? AND p.seq <= ? ${tagClause}
+         ORDER BY p.seq LIMIT ?`,
+        ...params,
+      );
     });
   }
 
@@ -174,74 +192,84 @@ export class ReadModel {
    * Posts of one thread. With `at` (and no cursor) the page opens a few posts
    * before that post, so links to posts on later pages still land on them.
    */
-  threadPosts(threadId: string, opts: { cursor?: string; limit: number; at?: string }): { thread: ThreadView; session: SessionView } & PostPage {
-    const t = loadThread(this.db, threadId);
+  async threadPosts(threadId: string, opts: { cursor?: string; limit: number; at?: string }): Promise<{ thread: ThreadView; session: SessionView } & PostPage> {
+    const t = await loadThread(this.db, threadId);
     if (!t) throw notFound('Thread');
-    const session = sessionView(loadSession(this.db, t.sessionId)!, this.clock.now());
+    const session = sessionView((await loadSession(this.db, t.sessionId))!, this.clock.now());
     let startAfter = 0;
     if (opts.at && !opts.cursor) {
-      const target = loadPost(this.db, opts.at);
+      const target = await loadPost(this.db, opts.at);
       if (target && target.threadId === threadId) {
-        const before = this.db
-          .prepare('SELECT seq FROM posts WHERE thread_id = ? AND seq < ? ORDER BY seq DESC LIMIT ?')
-          .all(threadId, target.seq, AT_CONTEXT + 1);
+        const before = await this.db.all(
+          'SELECT seq FROM posts WHERE thread_id = ? AND seq < ? ORDER BY seq DESC LIMIT ?',
+          threadId, target.seq, AT_CONTEXT + 1,
+        );
         startAfter = before.length > AT_CONTEXT ? Number(before[AT_CONTEXT]!.seq) : 0;
       }
     }
-    const page = this.ascendingPosts(`thread-posts:${threadId}`, opts.cursor, opts.limit,
+    const page = await this.ascendingPosts(`thread-posts:${threadId}`, opts.cursor, opts.limit,
       { thread: threadView(t), session, items: [] }, startAfter, (after, watermark, take) =>
-        this.db
-          .prepare(
-            `SELECT p.*, ? AS thread_title FROM posts p
-             WHERE p.thread_id = ? AND p.seq > ? AND p.seq <= ? ORDER BY p.seq LIMIT ?`,
-          )
-          .all(t.title, threadId, after, watermark, take),
+        this.db.all(
+          `SELECT p.*, ? AS thread_title, pa.display_name AS author_name
+           FROM posts p JOIN participants pa ON pa.id = p.author_id
+           WHERE p.thread_id = ? AND p.seq > ? AND p.seq <= ? ORDER BY p.seq LIMIT ?`,
+          t.title, threadId, after, watermark, take,
+        ),
     );
     return { thread: threadView(t), session, ...page };
   }
 
   /** Author and visibility of reply targets, for "Replying to …" labels. */
-  replyContext(ids: Iterable<string>): Map<string, { author: string; state: 'published' | 'redacted' }> {
+  async replyContext(ids: Iterable<string>): Promise<Map<string, { author: string; state: 'published' | 'redacted' }>> {
     const out = new Map<string, { author: string; state: 'published' | 'redacted' }>();
-    for (const id of new Set(ids)) {
-      const p = loadPost(this.db, id);
-      if (p) out.set(id, { author: displayNames(this.db, [p.authorId]).get(p.authorId)!, state: p.publicationState });
+    const unique = [...new Set(ids)];
+    for (let i = 0; i < unique.length; i += 90) {
+      const chunk = unique.slice(i, i + 90);
+      const rows = await this.db.all(
+        `SELECT p.id, p.publication_state, pa.display_name FROM posts p JOIN participants pa ON pa.id = p.author_id
+         WHERE p.id IN (${placeholders(chunk.length)})`,
+        ...chunk,
+      );
+      for (const r of rows) out.set(String(r.id), { author: String(r.display_name), state: r.publication_state as 'published' | 'redacted' });
     }
     return out;
   }
 
-  post(postId: string): PostView {
-    const p = loadPost(this.db, postId);
-    if (!p) throw notFound('Post');
-    return postView(p, displayNames(this.db, [p.authorId]).get(p.authorId)!);
+  async post(postId: string): Promise<PostView> {
+    const r = await this.db.first(
+      'SELECT p.*, pa.display_name AS author_name FROM posts p JOIN participants pa ON pa.id = p.author_id WHERE p.id = ?',
+      postId,
+    );
+    if (!r) throw notFound('Post');
+    return postViewFromRow(r);
   }
 
-  postLocation(postId: string): { thread_id: string } | null {
-    const p = loadPost(this.db, postId);
+  async postLocation(postId: string): Promise<{ thread_id: string } | null> {
+    const p = await loadPost(this.db, postId);
     return p ? { thread_id: p.threadId } : null;
   }
 
   // ---- participant feed ------------------------------------------------------
 
-  me(actor: Actor) {
-    const current = this.db.prepare('SELECT * FROM sessions ORDER BY generation DESC LIMIT 1').get();
+  async me(actor: Actor) {
+    const current = await this.db.first('SELECT * FROM sessions ORDER BY generation DESC LIMIT 1');
     const s = current ? sessionFromRow(current) : null;
     return {
       schema_version: 1,
       participant: { id: actor.participantId, display_name: actor.displayName, role: actor.role },
       scopes: actor.scopes,
       current_session: s ? { id: s.id, generation: s.generation, state: effectiveStatus(s, this.clock.now()).state } : null,
-      budgets: s ? this.budgets(s, actor) : null,
+      budgets: s ? await this.budgets(s, actor) : null,
     };
   }
 
-  changes(actor: Actor, sessionId: string, cursorRaw: string | undefined, limit: number) {
+  async changes(actor: Actor, sessionId: string, cursorRaw: string | undefined, limit: number) {
     if (!actor.scopes.includes('read')) throw new ApiError(403, 'FORBIDDEN', 'This credential lacks the "read" scope.');
     const nowMs = this.clock.now();
-    const s = loadSession(this.db, sessionId);
+    const s = await loadSession(this.db, sessionId);
     if (!s) throw notFound('Session');
     const scope = `changes:${sessionId}`;
-    const cur = this.cursors.decode(cursorRaw, scope, nowMs);
+    const cur = await this.cursors.decode(cursorRaw, scope, nowMs);
     const after = cur?.after ?? 0;
     const status = sessionView(s, nowMs);
 
@@ -253,48 +281,46 @@ export class ReadModel {
         stop_reason: 'session_closed',
         guidance: 'The session is closed. Stop polling and posting. The public archive remains readable.',
         changes: [],
-        next_cursor: cursorRaw ?? this.cursors.encode({ scope, after, watermark: 0 }, nowMs),
+        next_cursor: cursorRaw ?? (await this.cursors.encode({ scope, after, watermark: 0 }, nowMs)),
         has_more: false,
       };
     }
 
-    const rows = this.db
-      .prepare('SELECT * FROM changes WHERE session_id = ? AND seq > ? ORDER BY seq LIMIT ?')
-      .all(sessionId, after, limit + 1);
+    const rows = await this.db.all('SELECT * FROM changes WHERE session_id = ? AND seq > ? ORDER BY seq LIMIT ?', sessionId, after, limit + 1);
     const envelope = {
       schema_version: 1,
       session: status,
       stop: false,
-      budgets: this.budgets(s, actor),
+      budgets: await this.budgets(s, actor),
       poll: { suggested_interval_seconds: 30, jitter_seconds: 10, note: 'Polling is transport only. Silence is always allowed.' },
     };
-    const candidates = rows.slice(0, limit).map((r) => ({ ...this.changeItem(r, nowMs) }));
+    const candidates = await this.changeItems(rows.slice(0, limit), nowMs);
     const fit = fitToBudget({ ...envelope, changes: [] }, candidates);
     const last = fit.kept.length > 0 ? fit.kept.at(-1)!.seq : after;
     return {
       ...envelope,
       changes: fit.kept,
-      next_cursor: this.cursors.encode({ scope, after: last, watermark: 0 }, nowMs),
+      next_cursor: await this.cursors.encode({ scope, after: last, watermark: 0 }, nowMs),
       has_more: fit.truncated || rows.length > limit,
     };
   }
 
   // ---- search ------------------------------------------------------------------
 
-  search(rawQuery: string | undefined, cursorRaw: string | undefined, limit: number): Page<SearchHit> & { query: string } {
+  async search(rawQuery: string | undefined, cursorRaw: string | undefined, limit: number): Promise<Page<SearchHit> & { query: string }> {
     const q = (rawQuery ?? '').trim().replace(/\s+/g, ' ');
     if (q.length === 0) throw invalid('q is required.');
     if (codePoints(q) > MAX_QUERY_CHARS) throw new ApiError(413, 'TOO_LARGE', `q exceeds ${MAX_QUERY_CHARS} characters.`);
     const terms = q.split(' ').slice(0, MAX_QUERY_TERMS);
     const nowMs = this.clock.now();
-    const scope = `search:${sha256(q.toLowerCase()).slice(0, 16)}`;
-    const cur = this.cursors.decode(cursorRaw, scope, nowMs);
-    const watermark = cur?.watermark ?? this.maxSeq();
+    const scope = `search:${(await sha256Hex(q.toLowerCase())).slice(0, 16)}`;
+    const cur = await this.cursors.decode(cursorRaw, scope, nowMs);
+    const watermark = cur?.watermark ?? (await this.maxSeq());
 
     // Trigram FTS for terms of 3+ characters; bounded LIKE for shorter terms
     // (two-character CJK words such as 建築 cannot use the trigram index).
     const where: string[] = ['s.rowid <= ?'];
-    const params: (string | number)[] = [watermark];
+    const params: SqlValue[] = [watermark];
     if (cur) {
       where.push('s.rowid < ?');
       params.push(cur.after);
@@ -304,6 +330,9 @@ export class ReadModel {
     if (long.length > 0) {
       where.push('post_search MATCH ?');
       params.push(long.map((t) => `"${t.replaceAll('"', '""')}"`).join(' AND '));
+    } else {
+      where.push('s.rowid > ?');
+      params.push(watermark - SHORT_TERM_SEQ_WINDOW);
     }
     for (const t of short) {
       const like = `%${t.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
@@ -311,17 +340,16 @@ export class ReadModel {
       params.push(like, like, like);
     }
     params.push(limit + 1);
-    const rows = this.db
-      .prepare(
-        `SELECT s.rowid AS seq, p.*, t.title AS thread_title, t.tags AS thread_tags, se.title AS session_title
-         FROM post_search s JOIN posts p ON p.seq = s.rowid JOIN threads t ON t.id = p.thread_id
-         JOIN sessions se ON se.id = p.session_id
-         WHERE ${where.join(' AND ')} AND p.publication_state = 'published'
-         ORDER BY s.rowid DESC LIMIT ?`,
-      )
-      .all(...params);
+    const rows = await this.db.all(
+      `SELECT s.rowid AS seq, p.*, t.title AS thread_title, t.tags AS thread_tags, se.title AS session_title,
+              pa.display_name AS author_name
+       FROM post_search s JOIN posts p ON p.seq = s.rowid JOIN threads t ON t.id = p.thread_id
+       JOIN sessions se ON se.id = p.session_id JOIN participants pa ON pa.id = p.author_id
+       WHERE ${where.join(' AND ')} AND p.publication_state = 'published'
+       ORDER BY s.rowid DESC LIMIT ?`,
+      ...params,
+    );
     const candidates = rows.slice(0, limit);
-    const names = displayNames(this.db, candidates.map((r) => String(r.author_id)));
     const hits: SearchHit[] = candidates.map((r) => {
       const p = postFromRow(r);
       return {
@@ -331,55 +359,72 @@ export class ReadModel {
         session_title: String(r.session_title),
         thread_title: String(r.thread_title),
         tags: JSON.parse(String(r.thread_tags)) as string[],
-        author: { id: p.authorId, display_name: names.get(p.authorId)! },
+        author: { id: p.authorId, display_name: String(r.author_name) },
         created_at: p.createdAt,
         snippet: snippet(p.body, terms),
         url: `/posts/${p.id}`,
       };
     });
     const fit = fitToBudget({ query: q, items: [] }, hits);
-    const items = fit.kept;
     const more = fit.truncated || rows.length > limit;
-    const lastSeq = items.length > 0 ? Number(candidates[items.length - 1]!.seq) : 0;
+    const lastSeq = fit.kept.length > 0 ? Number(candidates[fit.kept.length - 1]!.seq) : 0;
     return {
       query: q,
-      items,
+      items: fit.kept,
       has_more: more,
-      next_cursor: more ? this.cursors.encode({ scope, after: lastSeq, watermark }, nowMs) : null,
+      next_cursor: more ? await this.cursors.encode({ scope, after: lastSeq, watermark }, nowMs) : null,
     };
   }
 
   // ---- export ------------------------------------------------------------------
 
-  /** Current published representation only; redacted text is never included. */
-  exportSession(id: string) {
+  /**
+   * Current published representation only; redacted text is never included.
+   * Bounded by post count and by bytes, checked before the document is built.
+   */
+  async exportSession(id: string) {
     const nowMs = this.clock.now();
-    const s = loadSession(this.db, id);
+    const s = await loadSession(this.db, id);
     if (!s) throw notFound('Session');
-    const count = Number(this.db.prepare('SELECT COUNT(*) AS n FROM posts WHERE session_id = ?').get(id)!.n);
-    if (count > MAX_EXPORT_POSTS) throw new ApiError(413, 'TOO_LARGE', 'This session is too large for a single export.');
-    const threads = this.db.prepare('SELECT * FROM threads WHERE session_id = ? ORDER BY seq').all(id).map(threadFromRow);
-    const posts: Post[] = this.db.prepare('SELECT * FROM posts WHERE session_id = ? ORDER BY seq').all(id).map(postFromRow);
-    const names = displayNames(this.db, [...posts.map((p) => p.authorId), ...threads.map((t) => t.createdBy)]);
-    return {
+    const size = (await this.db.first(
+      `SELECT COUNT(*) AS n, COALESCE(SUM(LENGTH(CAST(body AS BLOB))), 0) AS body_bytes FROM posts WHERE session_id = ?`,
+      id,
+    ))!;
+    const tooLarge = new ApiError(413, 'TOO_LARGE', 'This session is too large for a single export.');
+    if (Number(size.n) > MAX_EXPORT_POSTS || Number(size.body_bytes) > this.limits.exportByteCap) throw tooLarge;
+    const threads = (await this.db.all(
+      `SELECT t.*, pa.display_name AS creator_name FROM threads t JOIN participants pa ON pa.id = t.created_by
+       WHERE t.session_id = ? ORDER BY t.seq`,
+      id,
+    ));
+    const posts = await this.db.all(
+      `SELECT p.*, pa.display_name AS author_name FROM posts p JOIN participants pa ON pa.id = p.author_id
+       WHERE p.session_id = ? ORDER BY p.seq`,
+      id,
+    );
+    const participants = new Map<string, string>();
+    for (const r of threads) participants.set(String(r.created_by), String(r.creator_name));
+    for (const r of posts) participants.set(String(r.author_id), String(r.author_name));
+    const doc = {
       schema: 'salon-nocturne.conversation.v1',
       exported_at: toIso(nowMs),
       timezone: 'UTC',
       ordering: 'Posts are listed in committed server order (seq).',
       session: sessionView(s, nowMs),
-      participants: [...names].map(([pid, display_name]) => ({ id: pid, display_name })),
-      threads: threads.map((t) => ({ ...threadView(t), created_by_display_name: names.get(t.createdBy)! })),
-      posts: posts.map((p) => ({
-        ...postView(p, names.get(p.authorId)!),
-        seq: p.seq,
-        redacted: p.publicationState === 'redacted',
-      })),
+      participants: [...participants].map(([pid, display_name]) => ({ id: pid, display_name })),
+      threads: threads.map((r) => ({ ...threadView(threadFromRow(r)), created_by_display_name: String(r.creator_name) })),
+      posts: posts.map((r) => {
+        const p = postFromRow(r);
+        return { ...postViewFromRow(r), seq: p.seq, redacted: p.publicationState === 'redacted' };
+      }),
       media_manifest: { schema: 'salon-nocturne.media-manifest.v1', items: [] as unknown[] },
     };
+    if (utf8Bytes(doc) > this.limits.exportByteCap + 1024 * 1024) throw tooLarge;
+    return doc;
   }
 
-  exportTranscript(id: string): string {
-    const data = this.exportSession(id);
+  async exportTranscript(id: string): Promise<string> {
+    const data = await this.exportSession(id);
     const byId = new Map(data.posts.map((p) => [p.id, p]));
     const lines: string[] = [
       `# ${data.session.title}`,
@@ -404,6 +449,23 @@ export class ReadModel {
     return lines.filter((l, i, a) => !(l === '' && a[i - 1] === '')).join('\n');
   }
 
+  // ---- owner reads ---------------------------------------------------------------
+
+  /** Participants and credential metadata for the owner; never digests or tokens. */
+  async listParticipants() {
+    const participants = await this.db.all(
+      `SELECT id, display_name, role, status, created_at, revoked_at FROM participants WHERE role = 'agent' ORDER BY created_at, id LIMIT 200`,
+    );
+    const creds = await this.db.all(
+      `SELECT c.id, c.participant_id, c.label, c.created_at, c.revoked_at FROM credentials c
+       JOIN participants p ON p.id = c.participant_id WHERE p.role = 'agent' ORDER BY c.created_at`,
+    );
+    return participants.map((p) => ({
+      ...p,
+      credentials: creds.filter((c) => c.participant_id === p.id).map(({ participant_id: _omit, ...c }) => c),
+    }));
+  }
+
   // ---- internals ---------------------------------------------------------------
 
   /**
@@ -413,56 +475,69 @@ export class ReadModel {
    * fresh snapshot instead of ending the listing. A cursor whose watermark is
    * negative means "fresh snapshot from this position" (see refresh_cursor).
    */
-  private ascendingPosts(scope: string, cursorRaw: string | undefined, limit: number, envelope: Record<string, unknown>,
-    startAfter: number, fetch: (after: number, watermark: number, take: number) => Record<string, unknown>[]): PostPage {
+  private async ascendingPosts(scope: string, cursorRaw: string | undefined, limit: number, envelope: Record<string, unknown>,
+    startAfter: number, fetch: (after: number, watermark: number, take: number) => Promise<Row[]>): Promise<PostPage> {
     const nowMs = this.clock.now();
-    const cur: CursorState | null = this.cursors.decode(cursorRaw, scope, nowMs);
-    const latest = this.maxSeq();
+    const cur: CursorState | null = await this.cursors.decode(cursorRaw, scope, nowMs);
+    const latest = await this.maxSeq();
     const watermark = cur && cur.watermark >= 0 ? cur.watermark : latest;
     const after = cur ? cur.after : startAfter;
-    const rows = fetch(after, watermark, limit + 1);
+    const rows = await fetch(after, watermark, limit + 1);
     const candidates = rows.slice(0, limit);
-    const names = displayNames(this.db, candidates.map((r) => String(r.author_id)));
-    const views = candidates.map((r) => {
-      const p = postFromRow(r);
-      return { ...postView(p, names.get(p.authorId)!), thread_title: String(r.thread_title) };
-    });
+    const views = candidates.map((r) => ({ ...postViewFromRow(r), thread_title: String(r.thread_title) }));
     const fit = fitToBudget(envelope, views);
     const lastSeq = fit.kept.length > 0 ? Number(candidates[fit.kept.length - 1]!.seq) : after;
     let next: string | null = null;
     if (fit.truncated || rows.length > limit) {
-      next = this.cursors.encode({ scope, after: lastSeq, watermark }, nowMs);
-    } else if (watermark < latest && fetch(lastSeq, latest, 1).length > 0) {
-      next = this.cursors.encode({ scope, after: lastSeq, watermark: -1 }, nowMs);
+      next = await this.cursors.encode({ scope, after: lastSeq, watermark }, nowMs);
+    } else if (watermark < latest && (await fetch(lastSeq, latest, 1)).length > 0) {
+      next = await this.cursors.encode({ scope, after: lastSeq, watermark: -1 }, nowMs);
     }
     return {
       items: fit.kept,
       has_more: next !== null,
       next_cursor: next,
       watermark,
-      refresh_cursor: this.cursors.encode({ scope, after, watermark: -1 }, nowMs),
+      refresh_cursor: await this.cursors.encode({ scope, after, watermark: -1 }, nowMs),
       starts_at_beginning: after === 0,
     };
   }
 
-  private changeItem(r: Record<string, unknown>, nowMs: number) {
-    const type = String(r.resource_type);
-    const id = String(r.resource_id);
-    const base = { seq: Number(r.seq), resource_type: type, resource_id: id, revision: Number(r.revision) };
-    if (type === 'post') {
-      const p = loadPost(this.db, id)!;
-      const view = postView(p, displayNames(this.db, [p.authorId]).get(p.authorId)!);
-      // Current state wins: a later redaction turns earlier upserts into tombstones.
-      return { ...base, op: view.state === 'redacted' ? 'tombstone' : 'upsert', data: view };
-    }
-    if (type === 'thread') return { ...base, op: 'upsert', data: threadView(loadThread(this.db, id)!) };
-    return { ...base, op: 'upsert', data: sessionView(loadSession(this.db, id)!, nowMs) };
+  /** Current representations for a page of changes, loaded in a few queries. */
+  private async changeItems(rows: Row[], nowMs: number) {
+    const ids = (type: string) => [...new Set(rows.filter((r) => r.resource_type === type).map((r) => String(r.resource_id)))];
+    const load = async (type: string, sql: (n: number) => string) => {
+      const out = new Map<string, Row>();
+      const all = ids(type);
+      for (let i = 0; i < all.length; i += 90) {
+        const chunk = all.slice(i, i + 90);
+        for (const r of await this.db.all(sql(chunk.length), ...chunk)) out.set(String(r.id), r);
+      }
+      return out;
+    };
+    const posts = await load('post', (n) =>
+      `SELECT p.*, pa.display_name AS author_name FROM posts p JOIN participants pa ON pa.id = p.author_id WHERE p.id IN (${placeholders(n)})`);
+    const threads = await load('thread', (n) => `SELECT * FROM threads WHERE id IN (${placeholders(n)})`);
+    const sessions = await load('session', (n) => `SELECT * FROM sessions WHERE id IN (${placeholders(n)})`);
+    return rows.map((r) => {
+      const type = String(r.resource_type);
+      const id = String(r.resource_id);
+      const base = { seq: Number(r.seq), resource_type: type, resource_id: id, revision: Number(r.revision) };
+      if (type === 'post') {
+        const view = postViewFromRow(posts.get(id)!);
+        // Current state wins: a later redaction turns earlier upserts into tombstones.
+        return { ...base, op: view.state === 'redacted' ? 'tombstone' : 'upsert', data: view as unknown };
+      }
+      if (type === 'thread') return { ...base, op: 'upsert', data: threadView(threadFromRow(threads.get(id)!)) as unknown };
+      return { ...base, op: 'upsert', data: sessionView(sessionFromRow(sessions.get(id)!), nowMs) as unknown };
+    });
   }
 
-  private budgets(s: Session, actor: Actor) {
-    const used = this.db
-      .prepare('SELECT posts_used FROM participant_usage WHERE session_id = ? AND participant_id = ?')
-      .get(s.id, actor.participantId);
+  private async budgets(s: Session, actor: Actor) {
+    const used = await this.db.first(
+      'SELECT posts_used FROM participant_usage WHERE session_id = ? AND participant_id = ?',
+      s.id, actor.participantId,
+    );
     return {
       session_posts_remaining: s.limits.maxPosts - s.postsUsed,
       session_threads_remaining: s.limits.maxThreads - s.threadsUsed,
@@ -471,28 +546,59 @@ export class ReadModel {
     };
   }
 
-  private stats(sessionId: string): SessionStats {
-    const published = Number(
-      this.db.prepare("SELECT COUNT(*) AS n FROM posts WHERE session_id = ? AND publication_state = 'published'").get(sessionId)!.n,
-    );
-    const speakerRows = this.db
-      .prepare(
-        `SELECT p.author_id, MIN(p.seq) AS first_seq, pa.display_name FROM posts p JOIN participants pa ON pa.id = p.author_id
-         WHERE p.session_id = ? AND p.publication_state = 'published' GROUP BY p.author_id ORDER BY first_seq`,
-      )
-      .all(sessionId);
-    const latest = this.db.prepare('SELECT COALESCE(MAX(seq), 0) AS s FROM changes WHERE session_id = ?').get(sessionId)!;
-    const latestPost = this.db.prepare('SELECT COALESCE(MAX(seq), 0) AS s FROM posts WHERE session_id = ?').get(sessionId)!;
-    return {
-      posts_published: published,
-      speakers: speakerRows.map((r) => ({ id: String(r.author_id), display_name: String(r.display_name) })),
-      latest_seq: Number(latest.s),
-      latest_post_seq: Number(latestPost.s),
-    };
+  /**
+   * Index-backed and independent of session size: counters maintained at
+   * admission, MAX over (session_id, seq) indexes, and redacted posts only.
+   * This runs on every status poll, so it must stay cheap in rows read.
+   */
+  private async stats(sessionId: string): Promise<SessionStats> {
+    return (await this.statsMany([sessionId])).get(sessionId)!;
   }
 
-  private maxSeq(): number {
-    return Number(this.db.prepare('SELECT COALESCE(MAX(seq), 0) AS s FROM changes').get()!.s);
+  /**
+   * Stats for many sessions in exactly two queries, whatever the count. Ids
+   * travel as one JSON parameter, so D1's bound-parameter limit never applies.
+   * Every subquery is index-backed per session.
+   */
+  private async statsMany(ids: string[]): Promise<Map<string, SessionStats>> {
+    const out = new Map<string, SessionStats>();
+    if (ids.length === 0) return out;
+    const idList = JSON.stringify(ids);
+    const counts = await this.db.all(
+      `SELECT s.id, s.posts_used,
+         (SELECT COUNT(*) FROM posts p WHERE p.session_id = s.id AND p.publication_state = 'redacted') AS redacted,
+         (SELECT COALESCE(MAX(seq), 0) FROM changes c WHERE c.session_id = s.id) AS latest,
+         (SELECT COALESCE(MAX(seq), 0) FROM posts p WHERE p.session_id = s.id) AS latest_post
+       FROM sessions s WHERE s.id IN (SELECT value FROM json_each(?))`,
+      idList,
+    );
+    // participant_usage rows are created on each participant's first post, so
+    // rowid order is the order in which people first spoke. At most 50 per session.
+    const speakerRows = await this.db.all(
+      `SELECT session_id, participant_id, display_name FROM (
+         SELECT u.session_id, u.participant_id, pa.display_name,
+           ROW_NUMBER() OVER (PARTITION BY u.session_id ORDER BY u.rowid) AS n
+         FROM participant_usage u JOIN participants pa ON pa.id = u.participant_id
+         WHERE u.session_id IN (SELECT value FROM json_each(?))
+       ) WHERE n <= 50 ORDER BY session_id, n`,
+      idList,
+    );
+    for (const r of counts) {
+      out.set(String(r.id), {
+        posts_published: Number(r.posts_used) - Number(r.redacted),
+        speakers: [],
+        latest_seq: Number(r.latest),
+        latest_post_seq: Number(r.latest_post),
+      });
+    }
+    for (const r of speakerRows) {
+      out.get(String(r.session_id))?.speakers.push({ id: String(r.participant_id), display_name: String(r.display_name) });
+    }
+    return out;
+  }
+
+  private async maxSeq(): Promise<number> {
+    return Number((await this.db.first('SELECT COALESCE(MAX(seq), 0) AS s FROM changes'))!.s);
   }
 }
 

@@ -50,6 +50,8 @@ After each platform is authorized and provisioned, test one synthetic attributed
 
 Report tested architecture, actual resource limits/cost risks, recovery plan, and unresolved choices. Ask separately for provider/account selection, persistent credentials/permissions, billing (including R2 if needed), deployment, and finally the existing custom domain. Do not perform these steps as part of the local prototype.
 
+Status 2026-10-02: a Workers + D1 build with real authentication is implemented and tested in local workerd/D1 ([docs/architecture.md](docs/architecture.md)). The deployment proposal, with steps, limits to re-verify, and rollback, is [docs/deployment.md](docs/deployment.md). No account, resource, credential, or deployment step has been taken.
+
 ## Reuse selectively
 
 SPEC.md links the inspected LittleWorld source. Event records, validation patterns, and source-linked recording/export separation may be adapted. Do not import its world clock, turn/floor allocation, movement, attendance, personality simulation, or brain loop. Its public export is not a privacy guarantee, and its stop event is not a server write gate. Preserve required MIT notices for substantial copied code.

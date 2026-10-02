@@ -15,7 +15,7 @@ const agents = [TOKENS.aster, TOKENS.birch, TOKENS.cedar];
 function loadBrowserScript(name: string): Json {
   const context: Json = {};
   vm.createContext(context);
-  vm.runInContext(readFileSync(new URL(`../src/web/assets/${name}`, import.meta.url), 'utf8'), context);
+  vm.runInContext(readFileSync(new URL(`../public/assets/${name}`, import.meta.url), 'utf8'), context);
   return context;
 }
 
@@ -133,8 +133,8 @@ test('host post: a double submit sends once; a lost response retries with the sa
   const { SalonAdmin } = loadBrowserScript('admin.js');
   const s = await ctx.openSession();
   const { thread } = await ctx.startThread(s.id, s.generation);
-  const countPosts = () => Number(ctx.salon.db.prepare('SELECT COUNT(*) AS n FROM posts').get()!.n);
-  const used = () => Number(ctx.salon.db.prepare('SELECT posts_used FROM sessions').get()!.posts_used);
+  const countPosts = () => Number(ctx.raw.prepare('SELECT COUNT(*) AS n FROM posts').get()!.n);
+  const used = () => Number(ctx.raw.prepare('SELECT posts_used FROM sessions').get()!.posts_used);
   const request = { path: `/api/v1/threads/${thread.id}/posts`, body: { body: 'From the host.', session_id: s.id, generation: s.generation } };
   const realSend = async (req: typeof request, key: string) => {
     const r = await ctx.call('POST', req.path, { token: TOKENS.owner, key, body: req.body });
@@ -215,7 +215,7 @@ test('a tab watching session A stops when A closes, even after B opens', async (
   assert.equal(SalonNocturne.decidePoll(a.id, seen, { notFound: true }), 'stop');
   assert.equal(SalonNocturne.decidePoll(a.id, seen, { session: { id: b.id, state: 'open' } }), 'stop');
   assert.equal(SalonNocturne.decidePoll(a.id, seen, null), 'retry');
-  assert.ok(!readFileSync(new URL('../src/web/assets/app.js', import.meta.url), 'utf8').includes('/sessions/current'));
+  assert.ok(!readFileSync(new URL('../public/assets/app.js', import.meta.url), 'utf8').includes('/sessions/current'));
 });
 
 // ---- 5. UTF-8 response budget -----------------------------------------------------
@@ -245,6 +245,6 @@ test('paginated responses stay within the UTF-8 byte cap and continue without ga
 
   assert.deepEqual(await walk(`/api/v1/threads/${thread.id}/posts`, undefined, 'items', (p) => p.id), ids);
   assert.deepEqual(await walk(`/api/v1/sessions/${s.id}/posts`, undefined, 'items', (p) => p.id), ids);
-  const changeSeqs = ctx.salon.db.prepare('SELECT seq FROM changes WHERE session_id = ? ORDER BY seq').all(s.id).map((r) => String(r.seq));
+  const changeSeqs = ctx.raw.prepare('SELECT seq FROM changes WHERE session_id = ? ORDER BY seq').all(s.id).map((r) => String(r.seq));
   assert.deepEqual(await walk(`/api/v1/sessions/${s.id}/changes`, TOKENS.birch, 'changes', (c) => String(c.seq)), changeSeqs);
 });
