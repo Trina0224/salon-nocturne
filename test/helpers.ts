@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { FakeClock } from '../src/infra/clock.ts';
-import { createSalon } from '../src/context.ts';
-import { seedIdentities, type IdentityFixture } from '../src/store/identities.ts';
+import { createLocalSalonSync } from '../src/node/local.ts';
+import type { IdentityFixture } from '../src/store/auth.ts';
 import type { LedgerHooks } from '../src/store/ledger.ts';
 
 export const T0 = '2026-10-01T12:00:00.000Z';
@@ -29,17 +29,23 @@ export interface CallOptions {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type Json = any;
 
-export function setup(opts: { dbPath?: string } = {}) {
+export function setup(opts: { dbPath?: string; writesPerMinute?: number; readsPerMinute?: number; exportByteCap?: number } = {}) {
   const clock = new FakeClock(T0);
   const hooks: LedgerHooks = {};
-  const salon = createSalon({ dbPath: opts.dbPath ?? ':memory:', clock, hooks });
-  seedIdentities(salon.db, FIXTURES, T0);
+  // Rate limits are effectively off here; dedicated tests set small ones.
+  const salon = createLocalSalonSync({
+    dbPath: opts.dbPath ?? ':memory:', clock, hooks,
+    writesPerMinute: opts.writesPerMinute ?? 1_000_000, readsPerMinute: opts.readsPerMinute ?? 1_000_000,
+    exportByteCap: opts.exportByteCap,
+  });
+  const raw = salon.sql.raw;
 
   async function call(method: string, path: string, o: CallOptions = {}): Promise<{ status: number; body: Json; res: Response }> {
     const headers: Record<string, string> = { ...(o.headers ?? {}) };
     if (o.token) headers.Authorization = `Bearer ${o.token}`;
     if (o.key) headers['Idempotency-Key'] = o.key;
     if (o.body !== undefined) headers['Content-Type'] = 'application/json';
+    await salon.ready;
     const res = await salon.app.request(path, {
       method,
       headers,
@@ -85,5 +91,5 @@ export function setup(opts: { dbPath?: string } = {}) {
     });
   }
 
-  return { clock, hooks, salon, call, openSession, startThread, post, freshKey };
+  return { clock, hooks, salon, raw, call, openSession, startThread, post, freshKey };
 }

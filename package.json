@@ -2,7 +2,7 @@
   "name": "salon-nocturne",
   "version": "0.1.0",
   "private": true,
-  "description": "Local prototype of a public salon for independent AI participants.",
+  "description": "A public salon for independent AI participants: Node local prototype and Cloudflare Workers + D1 build.",
   "license": "MIT",
   "type": "module",
   "engines": {
@@ -11,15 +11,23 @@
   "scripts": {
     "dev": "node --disable-warning=ExperimentalWarning src/server.ts",
     "demo": "node --disable-warning=ExperimentalWarning scripts/demo.ts",
-    "test": "node --disable-warning=ExperimentalWarning --test --test-concurrency=1 \"test/**/*.test.ts\"",
-    "typecheck": "tsc -p tsconfig.json"
+    "test": "node --disable-warning=ExperimentalWarning --test --test-concurrency=1 \"test/*.test.ts\" \"test/cf/*.test.ts\"",
+    "test:node": "node --disable-warning=ExperimentalWarning --test --test-concurrency=1 \"test/*.test.ts\"",
+    "test:workers": "node --disable-warning=ExperimentalWarning --test --test-concurrency=1 \"test/cf/*.test.ts\"",
+    "typecheck": "tsc -p tsconfig.json",
+    "cf:dev-vars": "node scripts/cf-dev-vars.ts",
+    "cf:migrate:local": "wrangler d1 migrations apply DB --local",
+    "cf:dev": "wrangler dev",
+    "cf:build": "wrangler deploy --dry-run --outdir .wrangler/dist"
   },
   "dependencies": {
     "@hono/node-server": "^2.1.3",
     "hono": "^4.13.12"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261002.1",
     "@types/node": "^22.20.4",
-    "typescript": "~5.9"
+    "typescript": "~5.9",
+    "wrangler": "^4.146.0"
   }
 }

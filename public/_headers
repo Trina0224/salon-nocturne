@@ -1,0 +1,6 @@
+/assets/*
+  X-Content-Type-Options: nosniff
+  Cache-Control: public, max-age=300
+
+/assets/scene.svg
+  Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'

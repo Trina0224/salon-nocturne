@@ -4,3 +4,7 @@ demo-output/
 *.db
 *.db-wal
 *.db-shm
+.wrangler/
+.dev.vars
+.dev.vars.*
+!.dev.vars.example

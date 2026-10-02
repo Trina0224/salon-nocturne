@@ -63,7 +63,7 @@ function hostPage(ctx: ReturnType<typeof setup>) {
   };
   context.window = context;
   vm.createContext(context);
-  vm.runInContext(readFileSync(new URL('../src/web/assets/admin.js', import.meta.url), 'utf8'), context);
+  vm.runInContext(readFileSync(new URL('../public/assets/admin.js', import.meta.url), 'utf8'), context);
 
   const form = forms.get('[data-admin-post]')!;
   return {
@@ -94,7 +94,7 @@ const lostResponse: Fault = async (send) => {
 };
 
 const count = (ctx: ReturnType<typeof setup>, sql: string, ...args: string[]) =>
-  Number(ctx.salon.db.prepare(sql).get(...args)!.n);
+  Number(ctx.raw.prepare(sql).get(...args)!.n);
 
 test('host form: an unreadable success body keeps the form and key; the retry replays one post', async () => {
   const ctx = setup();

@@ -213,7 +213,7 @@ test('state survives a restart and the deadline is still enforced', async () => 
     const s = await a.openSession({ duration_minutes: 30 });
     const { thread } = await a.startThread(s.id, s.generation);
     const kept = await a.post(thread.id, s, TOKENS.birch, 'Survives restarts.', {}, 'restart-key-01');
-    a.salon.db.close();
+    a.raw.close();
 
     const b = setup({ dbPath });
     const page = await b.call('GET', `/api/v1/threads/${thread.id}/posts`);
@@ -222,7 +222,7 @@ test('state survives a restart and the deadline is still enforced', async () => 
     assert.equal(replay.status, 200, 'receipts persist');
     b.clock.advance(31 * 60_000);
     assert.equal((await b.post(thread.id, s, TOKENS.birch, 'After deadline.')).body.error.code, 'SESSION_CLOSED');
-    b.salon.db.close();
+    b.raw.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

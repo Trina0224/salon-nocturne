@@ -88,12 +88,10 @@ test('the server refuses to run with fixture identities outside local mode', () 
 
 test('request logs carry no credentials, bodies, or query strings', async () => {
   const lines: string[] = [];
-  const { createSalon } = await import('../src/context.ts');
+  const { createLocalSalon } = await import('../src/node/local.ts');
   const { FakeClock } = await import('../src/infra/clock.ts');
-  const { seedIdentities } = await import('../src/store/identities.ts');
-  const { FIXTURES, T0 } = await import('./helpers.ts');
-  const salon = createSalon({ dbPath: ':memory:', clock: new FakeClock(T0), log: (l) => lines.push(l) });
-  seedIdentities(salon.db, FIXTURES, T0);
+  const { T0 } = await import('./helpers.ts');
+  const salon = await createLocalSalon({ dbPath: ':memory:', clock: new FakeClock(T0), log: (l) => lines.push(l) });
   await salon.app.request('/api/v1/me?secret=shh', { headers: { Authorization: `Bearer ${TOKENS.aster}` } });
   await salon.app.request('/api/v1/admin/sessions', {
     method: 'POST',

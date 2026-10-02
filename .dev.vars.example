@@ -1,0 +1,5 @@
+# Names only. Generate real local values with `npm run cf:dev-vars`,
+# which writes .dev.vars (gitignored). Production values are set with
+# `wrangler secret put` and never stored in the repository.
+OWNER_TOKEN_SHA256=<64-hex SHA-256 of an owner token; comma-separate several to rotate>
+TOKEN_PEPPER=<at least 32 random characters>

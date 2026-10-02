@@ -1,11 +1,11 @@
-import { createHmac, timingSafeEqual } from 'node:crypto';
 import { ApiError } from '../domain/errors.ts';
+import { base64url, fromBase64url, hmacHex, timingSafeEqual, utf8 } from './crypto.ts';
 
 /**
  * Opaque pagination cursor. `after` is a position in the committed change
  * sequence, `watermark` freezes the snapshot so pages neither skip nor
- * duplicate records while new posts arrive, and `scope` binds the cursor to
- * one listing or query.
+ * duplicate records while new posts arrive (negative means "fresh snapshot"),
+ * and `scope` binds the cursor to one listing or query.
  */
 export interface CursorState {
   scope: string;
@@ -22,26 +22,21 @@ export class CursorCodec {
     this.secret = secret;
   }
 
-  encode(state: CursorState, nowMs: number): string {
-    const payload = Buffer.from(
-      JSON.stringify({ k: state.scope, a: state.after, w: state.watermark, t: nowMs }),
-    ).toString('base64url');
-    return `${payload}.${this.sign(payload)}`;
+  async encode(state: CursorState, nowMs: number): Promise<string> {
+    const payload = base64url(utf8(JSON.stringify({ k: state.scope, a: state.after, w: state.watermark, t: nowMs })));
+    return `${payload}.${await this.sign(payload)}`;
   }
 
   /** Returns null for an absent cursor (start from the beginning). */
-  decode(raw: string | undefined, scope: string, nowMs: number): CursorState | null {
+  async decode(raw: string | undefined, scope: string, nowMs: number): Promise<CursorState | null> {
     if (raw === undefined || raw === '') return null;
     const bad = new ApiError(400, 'INVALID_CURSOR', 'The cursor is malformed or belongs to another listing. Restart without a cursor.');
     if (raw.length > 512) throw bad;
     const [payload, sig] = raw.split('.');
-    if (!payload || !sig) throw bad;
-    const expected = Buffer.from(this.sign(payload));
-    const given = Buffer.from(sig);
-    if (expected.length !== given.length || !timingSafeEqual(expected, given)) throw bad;
+    if (!payload || !sig || !timingSafeEqual(await this.sign(payload), sig)) throw bad;
     let parsed: { k?: unknown; a?: unknown; w?: unknown; t?: unknown };
     try {
-      parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+      parsed = JSON.parse(new TextDecoder().decode(fromBase64url(payload)));
     } catch {
       throw bad;
     }
@@ -54,7 +49,7 @@ export class CursorCodec {
     return { scope, after: parsed.a, watermark: parsed.w };
   }
 
-  private sign(payload: string): string {
-    return createHmac('sha256', this.secret).update(payload).digest('base64url').slice(0, 22);
+  private async sign(payload: string): Promise<string> {
+    return (await hmacHex(this.secret, `cursor-v1:${payload}`)).slice(0, 32);
   }
 }

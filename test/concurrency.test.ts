@@ -8,22 +8,21 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { systemClock } from '../src/infra/clock.ts';
-import { createSalon } from '../src/context.ts';
-import { seedIdentities, resolveToken } from '../src/store/identities.ts';
-import { FIXTURES, TOKENS } from './helpers.ts';
+import { createLocalSalon } from '../src/node/local.ts';
+import { TOKENS } from './helpers.ts';
 import type { Job, Outcome } from './workers/admit-worker.ts';
 
-function fileSalon(limits: { maxPosts: number; maxPostsPerParticipant: number; maxThreads: number; maxBodyChars: number }) {
+async function fileSalon(limits: { maxPosts: number; maxPostsPerParticipant: number; maxThreads: number; maxBodyChars: number }) {
   const dir = mkdtempSync(join(tmpdir(), 'salon-race-'));
   const dbPath = join(dir, 'race.db');
-  const salon = createSalon({ dbPath, clock: systemClock });
-  seedIdentities(salon.db, FIXTURES, new Date().toISOString());
-  const owner = resolveToken(salon.db, TOKENS.owner);
+  const salon = await createLocalSalon({ dbPath, clock: systemClock, writesPerMinute: 1_000_000 });
+  const owner = await salon.auth.resolve(TOKENS.owner);
   if (owner.kind !== 'ok') throw new Error('owner fixture missing');
-  const session = salon.ledger.openSession(owner.actor, { title: 'Race', duration_minutes: 60, limits });
-  const opener = salon.ledger.createThread(owner.actor, session.id,
+  const session = await salon.ledger.openSession(owner.actor, { title: 'Race', duration_minutes: 60, limits });
+  const opener = await salon.ledger.createThread(owner.actor, session.id,
     { title: 'Race thread', tags: [], body: 'Opening.', generation: session.generation }, 'race-opener-1');
-  return { dir, dbPath, salon, session, threadId: opener.value.thread.id };
+  const db = salon.sql.raw;
+  return { dir, dbPath, db, close: () => salon.sql.close(), session, threadId: opener.value.thread.id };
 }
 
 async function race(dbPath: string, jobLists: Job[][]): Promise<Outcome[]> {
@@ -44,7 +43,7 @@ const agents = [TOKENS.aster, TOKENS.birch, TOKENS.cedar];
 
 test('concurrent writers spend the last quota unit exactly once', async () => {
   // The opener used 1 of 2 posts, leaving exactly one unit.
-  const { dir, dbPath, salon, session, threadId } = fileSalon({ maxPosts: 2, maxPostsPerParticipant: 5, maxThreads: 2, maxBodyChars: 200 });
+  const { dir, dbPath, db, close, session, threadId } = await fileSalon({ maxPosts: 2, maxPostsPerParticipant: 5, maxThreads: 2, maxBodyChars: 200 });
   try {
     const jobs: Job[][] = Array.from({ length: 8 }, (_, i) => [{
       kind: 'post', token: agents[i % 3]!, threadId, sessionId: session.id, generation: session.generation,
@@ -53,17 +52,17 @@ test('concurrent writers spend the last quota unit exactly once', async () => {
     const outcomes = await race(dbPath, jobs);
     assert.equal(outcomes.filter((o) => o.status === 201).length, 1);
     assert.equal(outcomes.filter((o) => o.code === 'QUOTA_EXHAUSTED').length, 7);
-    const row = salon.db.prepare('SELECT posts_used, (SELECT COUNT(*) FROM posts) AS n FROM sessions').get()!;
+    const row = db.prepare('SELECT posts_used, (SELECT COUNT(*) FROM posts) AS n FROM sessions').get()!;
     assert.equal(Number(row.posts_used), 2);
     assert.equal(Number(row.n), 2);
   } finally {
-    salon.db.close();
+    close();
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
 test('a close racing many posts has one committed order', async () => {
-  const { dir, dbPath, salon, session, threadId } = fileSalon({ maxPosts: 2000, maxPostsPerParticipant: 500, maxThreads: 2, maxBodyChars: 200 });
+  const { dir, dbPath, db, close, session, threadId } = await fileSalon({ maxPosts: 2000, maxPostsPerParticipant: 500, maxThreads: 2, maxBodyChars: 200 });
   try {
     // Each poster keeps posting until it is refused, pausing 1 ms between
     // posts so the closer can take the write lock (SQLite locking is not
@@ -83,15 +82,15 @@ test('a close racing many posts has one committed order', async () => {
     assert.ok(admitted >= 29, `the close waited for the race to start (admitted ${admitted})`);
     assert.deepEqual(outcomes.filter((o) => o.kind === 'close').map((o) => o.status), [200]);
 
-    const closeSeq = Number(salon.db.prepare("SELECT MAX(seq) AS s FROM changes WHERE resource_type = 'session'").get()!.s);
-    const lastPostSeq = Number(salon.db.prepare('SELECT MAX(seq) AS s FROM posts').get()!.s);
-    const closedAt = String(salon.db.prepare('SELECT closed_at FROM sessions').get()!.closed_at);
-    const lastPostAt = String(salon.db.prepare('SELECT MAX(created_at) AS t FROM posts').get()!.t);
+    const closeSeq = Number(db.prepare("SELECT MAX(seq) AS s FROM changes WHERE resource_type = 'session'").get()!.s);
+    const lastPostSeq = Number(db.prepare('SELECT MAX(seq) AS s FROM posts').get()!.s);
+    const closedAt = String(db.prepare('SELECT closed_at FROM sessions').get()!.closed_at);
+    const lastPostAt = String(db.prepare('SELECT MAX(created_at) AS t FROM posts').get()!.t);
     assert.ok(lastPostSeq < closeSeq, 'no post committed after the close');
     assert.ok(lastPostAt <= closedAt, 'no admitted post is timestamped after the close');
-    assert.equal(Number(salon.db.prepare('SELECT COUNT(*) AS n FROM posts').get()!.n), admitted + 1);
+    assert.equal(Number(db.prepare('SELECT COUNT(*) AS n FROM posts').get()!.n), admitted + 1);
   } finally {
-    salon.db.close();
+    close();
     rmSync(dir, { recursive: true, force: true });
   }
 });
