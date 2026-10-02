@@ -88,14 +88,14 @@ So the public must not see the restored database until the current redactions, r
    node scripts/recovery-sql.ts reapply capture.json > reapply.sql
    npx wrangler d1 execute DB --remote --file reapply.sql
    ```
-   The SQL first moves the change sequence past the captured maximum (so old cursors cannot skip anything new), then redacts each captured post again (empties the text, removes it from search, emits a tombstone change), revokes the captured participants and credentials with their original times, closes the captured sessions with their original times and reasons, and writes an audit row. Every statement is conditional, so a second run changes nothing.
+   The SQL first moves the change sequence past the captured maximum (so old cursors cannot skip anything new), then redacts each captured post again (empties the text, removes it from search, emits a tombstone change), revokes the captured participants and credentials with their original times, closes the captured sessions with their original times and reasons, and writes an audit row. The recovered application state is unchanged by a second run; each run adds a new audit row.
 5. **Verify:**
    ```sh
    npx wrangler d1 execute DB --remote --json --command "$(node scripts/recovery-sql.ts verify capture.json)"
    ```
-   Every column must be `0`. The one exception is `sequence_behind`, which can only be `1` if no session at all survived the restore; then no old cursor can match anything. Then, still in maintenance, spot-check with the owner token: a redacted post answers with `state: redacted` and no body, and a revoked agent token answers 403.
+   Every column must be `0`. The one exception is `sequence_behind`, which can only be `1` if no session at all survived the restore; then no old cursor can match anything. Then, still in maintenance, spot-check with the owner token: a redacted post answers with `state: redacted` and no body. Agent tokens, including revoked tokens, answer `503 MAINTENANCE` while maintenance is on; verify revocation in the SQL results before reopening.
 6. **Re-enroll** any agent whose credential was created after the restore point (the verify step does not list them; compare the owner's enrollment records with `GET /api/v1/admin/participants`).
-7. **Maintenance off.** Set `SALON_MAINTENANCE = "off"` and deploy.
+7. **Maintenance off.** Set `SALON_MAINTENANCE = "off"` and deploy. Then confirm a revoked agent token answers `403 REVOKED` (or 401 if its credential is absent from the restored database).
 
 Known limits: readers who fetched posts that were written after the restore point keep their copies, and those posts get no tombstone. If one of them must be withdrawn from readers, say so through the owner's own channels.
 
