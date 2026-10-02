@@ -14,6 +14,30 @@ export interface AppConfig {
   exportByteCap: number;
   /** Serve only the owner (restores and incidents). */
   maintenance: boolean;
+  /** The MCP endpoint and its OAuth resource server; null when not configured. */
+  mcp: McpConfig | null;
+}
+
+/** A JSON Web Key Set with public keys only. */
+export interface PublicJwks {
+  keys: Record<string, unknown>[];
+}
+
+export interface McpConfig {
+  /** Canonical URL of the MCP endpoint; access tokens must name it as their audience. */
+  resource: string;
+  /** The only accepted token issuer (exact match). */
+  issuer: string;
+  /** Authorization servers advertised in protected resource metadata. */
+  authorizationServers: string[];
+  /** Where the issuer's signing keys come from. */
+  jwks: { url: string } | { inline: PublicJwks };
+  /**
+   * Browser origins allowed to call /mcp. A request with an Origin header
+   * must match one exactly; requests without Origin (server-side clients)
+   * are allowed. Always includes the endpoint's own origin.
+   */
+  allowedOrigins: string[];
 }
 
 export const DEFAULTS = {
@@ -36,6 +60,84 @@ export interface WorkerEnv {
   TOKEN_PEPPER?: string;
   WRITES_PER_MINUTE?: string;
   EXPORT_BYTE_CAP?: string;
+  MCP_RESOURCE?: string;
+  OAUTH_ISSUER?: string;
+  OAUTH_AUTHORIZATION_SERVER?: string;
+  OAUTH_JWKS_URL?: string;
+  OAUTH_JWKS?: string;
+  MCP_ALLOWED_ORIGINS?: string;
+}
+
+const MCP_VARS = ['MCP_RESOURCE', 'OAUTH_ISSUER', 'OAUTH_AUTHORIZATION_SERVER', 'OAUTH_JWKS_URL', 'OAUTH_JWKS', 'MCP_ALLOWED_ORIGINS'] as const;
+const PRIVATE_JWK_MEMBERS = ['d', 'p', 'q', 'dp', 'dq', 'qi', 'k'];
+
+/** https, or http only on a loopback host (local development). */
+function secureUrl(raw: string): URL | null {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    return null;
+  }
+  if (u.username || u.password || u.hash) return null;
+  if (u.protocol === 'https:') return u;
+  if (u.protocol === 'http:' && (u.hostname === '127.0.0.1' || u.hostname === 'localhost' || u.hostname === '[::1]')) return u;
+  return null;
+}
+
+/**
+ * MCP/OAuth settings are all-or-nothing: none set disables the MCP endpoint;
+ * a partial or invalid set is a configuration error, so the Worker fails
+ * closed instead of serving MCP with half a trust model. Values are public
+ * (URLs and public keys), but problems still never echo them.
+ */
+export function mcpConfig(env: Pick<WorkerEnv, (typeof MCP_VARS)[number]>, problems: string[]): McpConfig | null {
+  const set = MCP_VARS.filter((k) => (env[k] ?? '').trim() !== '');
+  if (set.length === 0) return null;
+  const before = problems.length;
+  const resource = secureUrl((env.MCP_RESOURCE ?? '').trim());
+  if (!resource || resource.search || resource.pathname !== '/mcp') {
+    problems.push('MCP_RESOURCE must be the https URL of the /mcp endpoint, without query or fragment.');
+  }
+  const issuer = (env.OAUTH_ISSUER ?? '').trim();
+  if (!secureUrl(issuer)) problems.push('OAUTH_ISSUER must be an https URL.');
+  const asRaw = (env.OAUTH_AUTHORIZATION_SERVER ?? '').trim() || issuer;
+  if (!secureUrl(asRaw)) problems.push('OAUTH_AUTHORIZATION_SERVER must be an https URL.');
+  const jwksUrl = (env.OAUTH_JWKS_URL ?? '').trim();
+  const jwksJson = (env.OAUTH_JWKS ?? '').trim();
+  let jwks: McpConfig['jwks'] | null = null;
+  if (Boolean(jwksUrl) === Boolean(jwksJson)) {
+    problems.push('Set exactly one of OAUTH_JWKS_URL or OAUTH_JWKS.');
+  } else if (jwksUrl) {
+    if (secureUrl(jwksUrl)) jwks = { url: jwksUrl };
+    else problems.push('OAUTH_JWKS_URL must be an https URL.');
+  } else {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(jwksJson);
+    } catch {
+      parsed = null;
+    }
+    const keys = (parsed as { keys?: unknown })?.keys;
+    if (!Array.isArray(keys) || keys.length === 0 || !keys.every((k) => k && typeof k === 'object')) {
+      problems.push('OAUTH_JWKS must be a JSON Web Key Set with at least one key.');
+    } else if (keys.some((k) => PRIVATE_JWK_MEMBERS.some((m) => m in (k as object)))) {
+      problems.push('OAUTH_JWKS must contain public keys only.');
+    } else {
+      jwks = { inline: { keys: keys as Record<string, unknown>[] } };
+    }
+  }
+  const extraOrigins = (env.MCP_ALLOWED_ORIGINS ?? '').split(',').map((o) => o.trim()).filter(Boolean);
+  for (const o of extraOrigins) {
+    const u = secureUrl(o);
+    if (!u || u.origin !== o) {
+      problems.push('MCP_ALLOWED_ORIGINS must be comma-separated origins (scheme, host, optional port; no path or trailing slash).');
+      break;
+    }
+  }
+  if (problems.length > before || !resource || !jwks) return null;
+  const allowedOrigins = [...new Set([resource.origin, ...extraOrigins])];
+  return { resource: resource.href, issuer, authorizationServers: [asRaw], jwks, allowedOrigins };
 }
 
 export type ConfigResult = { ok: true; config: AppConfig } | { ok: false; problems: string[] };
@@ -73,6 +175,8 @@ export function workerConfig(env: WorkerEnv): ConfigResult {
   const mode = (env.SALON_MAINTENANCE ?? 'off').trim().toLowerCase();
   if (mode !== 'on' && mode !== 'off') problems.push('SALON_MAINTENANCE must be "on" or "off".');
 
+  const mcp = mcpConfig(env, problems);
+
   if (problems.length > 0) return { ok: false, problems };
-  return { ok: true, config: { ownerTokenHashes: hashes, tokenPepper: pepper, writesPerMinute, exportByteCap, maintenance: mode === 'on' } };
+  return { ok: true, config: { ownerTokenHashes: hashes, tokenPepper: pepper, writesPerMinute, exportByteCap, maintenance: mode === 'on', mcp } };
 }

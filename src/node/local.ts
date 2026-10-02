@@ -9,7 +9,7 @@ import type { Hono } from 'hono';
 import { NodeSql } from './sqlite.ts';
 import type { Clock } from '../infra/clock.ts';
 import { MemoryReadLimiter } from '../infra/ratelimit.ts';
-import { DEFAULTS, LOCAL_PEPPER, type AppConfig } from '../config.ts';
+import { DEFAULTS, LOCAL_PEPPER, type AppConfig, type McpConfig } from '../config.ts';
 import { createSalon, type Salon } from '../context.ts';
 import { seedFixtures, type IdentityFixture } from '../store/auth.ts';
 import type { LedgerHooks } from '../store/ledger.ts';
@@ -42,6 +42,8 @@ export interface LocalOptions {
   requestsPerMinute?: number;
   exportByteCap?: number;
   maintenance?: boolean;
+  /** MCP endpoint and OAuth resource server (tests and the synthetic local issuer). */
+  mcp?: McpConfig | null;
 }
 
 export interface LocalSalon extends Salon {
@@ -59,6 +61,7 @@ export function createLocalSalonSync(opts: LocalOptions): LocalSalon {
     writesPerMinute: opts.writesPerMinute ?? DEFAULTS.writesPerMinute,
     exportByteCap: opts.exportByteCap ?? DEFAULTS.exportByteCap,
     maintenance: opts.maintenance ?? false,
+    mcp: opts.mcp ?? null,
   };
   const sql = new NodeSql(opts.dbPath);
   const salon = createSalon({

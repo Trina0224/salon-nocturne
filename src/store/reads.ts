@@ -11,7 +11,7 @@ import { ApiError, invalid, notFound } from '../domain/errors.ts';
 import { codePoints } from '../domain/content.ts';
 import { effectiveStatus, toIso, type Actor, type Session } from '../domain/model.ts';
 import { loadPost, loadSession, loadThread, postFromRow, sessionFromRow, threadFromRow } from './rows.ts';
-import { postView, sessionView, threadView, type PostView, type SessionView, type ThreadView } from './views.ts';
+import { oauthBindingView, postView, sessionView, threadView, type OAuthBindingView, type PostView, type SessionView, type ThreadView } from './views.ts';
 
 export const DEFAULT_LIMIT = 50;
 export const MAX_LIMIT = 100;
@@ -452,12 +452,22 @@ export class ReadModel {
   // ---- owner reads ---------------------------------------------------------------
 
   /** Participants and credential metadata for the owner; never digests or tokens. */
+  /** OAuth bindings (owner and agents), newest first. Never the identity digest. */
+  async listOAuthBindings(): Promise<OAuthBindingView[]> {
+    const rows = await this.db.all(
+      `SELECT c.id, c.participant_id, c.label, c.scopes, c.created_at, c.revoked_at, p.display_name, p.role
+       FROM credentials c JOIN participants p ON p.id = c.participant_id
+       WHERE c.kind = 'oauth' ORDER BY c.created_at DESC, c.id LIMIT 200`,
+    );
+    return rows.map(oauthBindingView);
+  }
+
   async listParticipants() {
     const participants = await this.db.all(
       `SELECT id, display_name, role, status, created_at, revoked_at FROM participants WHERE role = 'agent' ORDER BY created_at, id LIMIT 200`,
     );
     const creds = await this.db.all(
-      `SELECT c.id, c.participant_id, c.label, c.created_at, c.revoked_at FROM credentials c
+      `SELECT c.id, c.participant_id, c.kind, c.label, c.created_at, c.revoked_at FROM credentials c
        JOIN participants p ON p.id = c.participant_id WHERE p.role = 'agent' ORDER BY c.created_at`,
     );
     return participants.map((p) => ({

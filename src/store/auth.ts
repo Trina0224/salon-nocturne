@@ -20,6 +20,12 @@ export interface AuthConfig {
 
 export type Resolution = { kind: 'ok'; actor: Actor } | { kind: 'revoked' } | { kind: 'unknown' };
 
+/** An OAuth connection resolved through its server-side binding. */
+export type OAuthResolution = { kind: 'ok'; actor: Actor; label: string } | { kind: 'revoked' } | { kind: 'unknown' };
+
+/** Scopes an OAuth binding can ever carry. Admin authority never travels over OAuth. */
+export const OAUTH_BINDING_SCOPES: Scope[] = ['read', 'post'];
+
 export class Authenticator {
   private readonly db: SqlDb;
   private readonly config: AuthConfig;
@@ -31,6 +37,14 @@ export class Authenticator {
 
   credentialDigest(token: string): Promise<string> {
     return hmacHex(this.config.tokenPepper, `agent-token-v1:${token}`);
+  }
+
+  /**
+   * Digest of a validated OAuth identity. Issuer and subject are external
+   * account identifiers, so only this keyed digest is stored.
+   */
+  oauthIdentityDigest(issuer: string, subject: string): Promise<string> {
+    return hmacHex(this.config.tokenPepper, `oauth-identity-v1:${issuer}\n${subject}`);
   }
 
   async resolve(token: string): Promise<Resolution> {
@@ -56,7 +70,7 @@ export class Authenticator {
     const r = await this.db.first(
       `SELECT c.id AS credential_id, c.scopes, c.revoked_at, p.id, p.display_name, p.role, p.status
        FROM credentials c JOIN participants p ON p.id = c.participant_id
-       WHERE c.token_digest = ?`,
+       WHERE c.token_digest = ? AND c.kind = 'token'`,
       await this.credentialDigest(token),
     );
     // Stored credentials are agent-only: an owner row in the table is ignored.
@@ -73,6 +87,39 @@ export class Authenticator {
       },
     };
   }
+}
+
+/**
+ * Resolves an OAuth identity whose token has already been validated (issuer,
+ * audience, expiry, signature). The participant and role come only from the
+ * server-side binding. Effective scopes are the binding's scopes intersected
+ * with the scopes the token grants, so a token can narrow access but never
+ * widen it, and never to admin.
+ */
+export async function resolveOAuthBinding(
+  db: SqlDb, auth: Authenticator, issuer: string, subject: string, grantedScopes: readonly Scope[],
+): Promise<OAuthResolution> {
+  const r = await db.first(
+    `SELECT c.id AS credential_id, c.scopes, c.label, c.revoked_at, p.id, p.display_name, p.role, p.status
+     FROM credentials c JOIN participants p ON p.id = c.participant_id
+     WHERE c.token_digest = ? AND c.kind = 'oauth'`,
+    await auth.oauthIdentityDigest(issuer, subject),
+  );
+  if (!r) return { kind: 'unknown' };
+  if (r.revoked_at !== null || r.status !== 'active') return { kind: 'revoked' };
+  const stored = JSON.parse(String(r.scopes)) as Scope[];
+  const scopes = OAUTH_BINDING_SCOPES.filter((s) => stored.includes(s) && grantedScopes.includes(s));
+  return {
+    kind: 'ok',
+    label: String(r.label),
+    actor: {
+      participantId: String(r.id),
+      credentialId: String(r.credential_id),
+      displayName: String(r.display_name),
+      role: r.role as Role,
+      scopes,
+    },
+  };
 }
 
 /**

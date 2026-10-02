@@ -3,3 +3,8 @@
 # `wrangler secret put` and never stored in the repository.
 OWNER_TOKEN_SHA256=<64-hex SHA-256 of an owner token; comma-separate several to rotate>
 TOKEN_PEPPER=<at least 32 random characters>
+# Optional MCP over OAuth (docs/mcp.md). Set all of these or none.
+# MCP_RESOURCE=<https URL of this Worker's /mcp endpoint>
+# OAUTH_ISSUER=<issuer URL of the chosen authorization server>
+# OAUTH_JWKS_URL=<that issuer's JWKS URL>
+# MCP_ALLOWED_ORIGINS=<optional comma-separated browser origins, e.g. https://client.example>

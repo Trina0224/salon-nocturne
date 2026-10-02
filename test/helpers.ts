@@ -3,6 +3,7 @@ import { FakeClock } from '../src/infra/clock.ts';
 import { createLocalSalonSync } from '../src/node/local.ts';
 import type { IdentityFixture } from '../src/store/auth.ts';
 import type { LedgerHooks } from '../src/store/ledger.ts';
+import type { McpConfig } from '../src/config.ts';
 
 export const T0 = '2026-10-01T12:00:00.000Z';
 
@@ -29,7 +30,7 @@ export interface CallOptions {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type Json = any;
 
-export function setup(opts: { dbPath?: string; writesPerMinute?: number; readsPerMinute?: number; requestsPerMinute?: number; exportByteCap?: number; maintenance?: boolean } = {}) {
+export function setup(opts: { dbPath?: string; writesPerMinute?: number; readsPerMinute?: number; requestsPerMinute?: number; exportByteCap?: number; maintenance?: boolean; mcp?: McpConfig | null } = {}) {
   const clock = new FakeClock(T0);
   const hooks: LedgerHooks = {};
   // Rate limits are effectively off here; dedicated tests set small ones.
@@ -37,7 +38,7 @@ export function setup(opts: { dbPath?: string; writesPerMinute?: number; readsPe
     dbPath: opts.dbPath ?? ':memory:', clock, hooks,
     writesPerMinute: opts.writesPerMinute ?? 1_000_000, readsPerMinute: opts.readsPerMinute ?? 1_000_000,
     requestsPerMinute: opts.requestsPerMinute ?? 1_000_000,
-    exportByteCap: opts.exportByteCap, maintenance: opts.maintenance,
+    exportByteCap: opts.exportByteCap, maintenance: opts.maintenance, mcp: opts.mcp,
   });
   const raw = salon.sql.raw;
 

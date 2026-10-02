@@ -8,6 +8,9 @@ import type { Ledger } from '../store/ledger.ts';
 import { parseLimit, type ReadModel } from '../store/reads.ts';
 import type { Authenticator } from '../store/auth.ts';
 import type { ReadLimiter } from '../infra/ratelimit.ts';
+import type { SqlDb } from '../infra/sql.ts';
+import type { McpConfig } from '../config.ts';
+import { mcpRoutes } from '../mcp/server.ts';
 
 export interface Limiters {
   /** Per client address, every request, before credential lookup. */
@@ -19,12 +22,15 @@ import { webRoutes } from '../web/routes.ts';
 import { notFoundPage } from '../web/pages.ts';
 
 export interface AppDeps {
+  db: SqlDb;
   auth: Authenticator;
   ledger: Ledger;
   reads: ReadModel;
   limiters: Limiters;
   /** When true, only the owner is served (for restores and incidents). */
   maintenance?: boolean;
+  /** MCP endpoint and OAuth resource server; absent or null disables /mcp. */
+  mcp?: McpConfig | null;
   /** Receives one secret-free line per request. */
   log?: (line: string) => void;
 }
@@ -211,12 +217,24 @@ export function createApp(deps: AppDeps): Hono<AppEnv> {
     const issued = await ledger.issueCredential(requireActor(c), c.req.param('id'), await readJson(c));
     return c.json({ schema_version: 1, ...issued }, 201);
   });
+  // OAuth identity bindings for the MCP endpoint. Revoke one with the
+  // credential revoke route below; its ID is the binding ID.
+  api.post('/admin/oauth-bindings', async (c) => {
+    const actor = requireOwner(c);
+    if (!deps.mcp) throw new ApiError(409, 'OAUTH_NOT_CONFIGURED', 'The MCP endpoint and its OAuth issuer are not configured.');
+    return c.json({ schema_version: 1, ...(await ledger.bindOAuthIdentity(actor, deps.mcp.issuer, await readJson(c))) }, 201);
+  });
+  api.get('/admin/oauth-bindings', async (c) => {
+    requireOwner(c);
+    return c.json({ schema_version: 1, bindings: await reads.listOAuthBindings() });
+  });
   api.post('/admin/credentials/:id/revoke', async (c) => {
     const r = await ledger.revokeCredential(requireActor(c), c.req.param('id'));
     return c.json({ schema_version: 1, credential: r.value }, r.status);
   });
 
   app.route('/api/v1', api);
+  if (deps.mcp) app.route('/', mcpRoutes({ config: deps.mcp, db: deps.db, auth, ledger, reads, limiters }));
   app.route('/', webRoutes(reads));
   app.notFound((c) =>
     c.req.path.startsWith('/api/')

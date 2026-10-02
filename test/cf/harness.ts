@@ -50,7 +50,7 @@ export async function d1Salon(opts: { clock: Clock; hooks?: LedgerHooks; writesP
   const salon = createSalon({
     db,
     clock: opts.clock,
-    config: { ownerTokenHashes: [OWNER_HASH], tokenPepper: PEPPER, writesPerMinute: opts.writesPerMinute ?? 1_000_000, exportByteCap: 2 * 1024 * 1024, maintenance: false },
+    config: { ownerTokenHashes: [OWNER_HASH], tokenPepper: PEPPER, writesPerMinute: opts.writesPerMinute ?? 1_000_000, exportByteCap: 2 * 1024 * 1024, maintenance: false, mcp: null },
     limiters: { requests: new MemoryReadLimiter(1_000_000, 60_000, opts.clock), participants: new MemoryReadLimiter(1_000_000, 60_000, opts.clock) },
     hooks: opts.hooks,
   });
