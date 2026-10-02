@@ -134,8 +134,10 @@ export class ReadModel {
     const before = cur ? cur.after : Number.MAX_SAFE_INTEGER;
     const rows = (await this.db.all('SELECT * FROM sessions WHERE generation < ? ORDER BY generation DESC LIMIT ?', before, limit + 1))
       .map(sessionFromRow);
-    const views: (SessionView & { stats: SessionStats })[] = [];
-    for (const s of rows.slice(0, limit)) views.push({ ...sessionView(s, nowMs), stats: await this.stats(s.id) });
+    const page = rows.slice(0, limit);
+    // Two queries for the whole page, never one per session.
+    const stats = await this.statsMany(page.map((s) => s.id));
+    const views = page.map((s) => ({ ...sessionView(s, nowMs), stats: stats.get(s.id)! }));
     const fit = fitToBudget({ items: [] }, views);
     const more = fit.truncated || rows.length > limit;
     const last = fit.kept.at(-1);
@@ -550,27 +552,49 @@ export class ReadModel {
    * This runs on every status poll, so it must stay cheap in rows read.
    */
   private async stats(sessionId: string): Promise<SessionStats> {
-    const counts = (await this.db.first(
-      `SELECT s.posts_used,
-         (SELECT COUNT(*) FROM posts WHERE session_id = ?1 AND publication_state = 'redacted') AS redacted,
-         (SELECT COALESCE(MAX(seq), 0) FROM changes WHERE session_id = ?1) AS latest,
-         (SELECT COALESCE(MAX(seq), 0) FROM posts WHERE session_id = ?1) AS latest_post
-       FROM sessions s WHERE s.id = ?1`,
-      sessionId,
-    ))!;
-    // participant_usage rows are created on each participant's first post, so
-    // rowid order is the order in which people first spoke.
-    const speakerRows = await this.db.all(
-      `SELECT u.participant_id, pa.display_name FROM participant_usage u JOIN participants pa ON pa.id = u.participant_id
-       WHERE u.session_id = ? ORDER BY u.rowid LIMIT 50`,
-      sessionId,
+    return (await this.statsMany([sessionId])).get(sessionId)!;
+  }
+
+  /**
+   * Stats for many sessions in exactly two queries, whatever the count. Ids
+   * travel as one JSON parameter, so D1's bound-parameter limit never applies.
+   * Every subquery is index-backed per session.
+   */
+  private async statsMany(ids: string[]): Promise<Map<string, SessionStats>> {
+    const out = new Map<string, SessionStats>();
+    if (ids.length === 0) return out;
+    const idList = JSON.stringify(ids);
+    const counts = await this.db.all(
+      `SELECT s.id, s.posts_used,
+         (SELECT COUNT(*) FROM posts p WHERE p.session_id = s.id AND p.publication_state = 'redacted') AS redacted,
+         (SELECT COALESCE(MAX(seq), 0) FROM changes c WHERE c.session_id = s.id) AS latest,
+         (SELECT COALESCE(MAX(seq), 0) FROM posts p WHERE p.session_id = s.id) AS latest_post
+       FROM sessions s WHERE s.id IN (SELECT value FROM json_each(?))`,
+      idList,
     );
-    return {
-      posts_published: Number(counts.posts_used) - Number(counts.redacted),
-      speakers: speakerRows.map((r) => ({ id: String(r.participant_id), display_name: String(r.display_name) })),
-      latest_seq: Number(counts.latest),
-      latest_post_seq: Number(counts.latest_post),
-    };
+    // participant_usage rows are created on each participant's first post, so
+    // rowid order is the order in which people first spoke. At most 50 per session.
+    const speakerRows = await this.db.all(
+      `SELECT session_id, participant_id, display_name FROM (
+         SELECT u.session_id, u.participant_id, pa.display_name,
+           ROW_NUMBER() OVER (PARTITION BY u.session_id ORDER BY u.rowid) AS n
+         FROM participant_usage u JOIN participants pa ON pa.id = u.participant_id
+         WHERE u.session_id IN (SELECT value FROM json_each(?))
+       ) WHERE n <= 50 ORDER BY session_id, n`,
+      idList,
+    );
+    for (const r of counts) {
+      out.set(String(r.id), {
+        posts_published: Number(r.posts_used) - Number(r.redacted),
+        speakers: [],
+        latest_seq: Number(r.latest),
+        latest_post_seq: Number(r.latest_post),
+      });
+    }
+    for (const r of speakerRows) {
+      out.get(String(r.session_id))?.speakers.push({ id: String(r.participant_id), display_name: String(r.display_name) });
+    }
+    return out;
   }
 
   private async maxSeq(): Promise<number> {

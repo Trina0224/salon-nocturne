@@ -237,3 +237,42 @@ test('/me reports identity and budgets without credential material', async () =>
   assert.equal(r.body.current_session.state, 'open');
   assert.ok(!JSON.stringify(r.body).includes('dev-agent'));
 });
+
+test('listing sessions and the archive cost a fixed number of queries, not one per session', async () => {
+  const { salon, call, openSession, startThread, post } = setup();
+  const ids: string[] = [];
+  for (let i = 0; i < 55; i++) {
+    const s = await openSession({ title: `Session ${i}` });
+    ids.push(s.id);
+    if (i % 2 === 0) {
+      const { thread } = await startThread(s.id, s.generation, TOKENS.aster);
+      await post(thread.id, s, TOKENS.birch, `Reply ${i}`);
+    }
+    assert.equal((await call('POST', `/api/v1/admin/sessions/${s.id}/close`, { token: TOKENS.owner, body: { expected_revision: s.revision } })).status, 200);
+  }
+  let queries = 0;
+  const sql = salon.sql;
+  for (const m of ['all', 'first', 'run', 'batch'] as const) {
+    const orig = sql[m].bind(sql) as (...a: unknown[]) => Promise<unknown>;
+    (sql as unknown as Record<string, unknown>)[m] = (...a: unknown[]) => {
+      queries++;
+      return orig(...a);
+    };
+  }
+  const page = await call('GET', '/api/v1/sessions?limit=50');
+  assert.equal(page.status, 200);
+  assert.equal(page.body.items.length, 50);
+  assert.equal(queries, 3, 'one page query plus two stats queries');
+  // Stats are still per session and correct.
+  const byId = new Map(page.body.items.map((s: { id: string }) => [s.id, s]));
+  const even = byId.get(ids[54]) as { stats: { posts_published: number; speakers: { display_name: string }[] } };
+  assert.equal(even.stats.posts_published, 2);
+  assert.deepEqual(even.stats.speakers.map((s) => s.display_name), ['Aster', 'Birch']);
+  const odd = byId.get(ids[53]) as { stats: { posts_published: number; speakers: unknown[] } };
+  assert.equal(odd.stats.posts_published, 0);
+  assert.deepEqual(odd.stats.speakers, []);
+
+  queries = 0;
+  assert.equal((await call('GET', '/archive')).status, 200);
+  assert.equal(queries, 3);
+});

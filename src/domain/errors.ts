@@ -20,6 +20,7 @@ export type ErrorCode =
   | 'QUOTA_EXHAUSTED'
   | 'RATE_LIMITED'
   | 'MISCONFIGURED'
+  | 'MAINTENANCE'
   | 'INTERNAL';
 
 export class ApiError extends Error {

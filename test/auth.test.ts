@@ -12,15 +12,17 @@ const goodPepper = createHash('sha256').update('a-pepper-for-config-tests').dige
 test('Worker config fails closed on missing or insecure settings, without echoing secrets', () => {
   const missing = workerConfig({});
   assert.equal(missing.ok, false);
-  if (!missing.ok) assert.equal(missing.problems.length, 4);
+  if (!missing.ok) assert.equal(missing.problems.length, 5);
 
   const cases: [string, Record<string, unknown>][] = [
-    ['no limiter', { DB: {}, OWNER_TOKEN_SHA256: goodHash, TOKEN_PEPPER: goodPepper }],
-    ['bad hash', { DB: {}, READ_LIMITER: limiter, OWNER_TOKEN_SHA256: 'not-a-hash', TOKEN_PEPPER: goodPepper }],
-    ['short pepper', { DB: {}, READ_LIMITER: limiter, OWNER_TOKEN_SHA256: goodHash, TOKEN_PEPPER: 'short' }],
-    ['local pepper', { DB: {}, READ_LIMITER: limiter, OWNER_TOKEN_SHA256: goodHash, TOKEN_PEPPER: LOCAL_PEPPER }],
-    ['placeholder', { DB: {}, READ_LIMITER: limiter, OWNER_TOKEN_SHA256: goodHash, TOKEN_PEPPER: '<at least 32 random characters, placeholder>' }],
-    ['bad limit', { DB: {}, READ_LIMITER: limiter, OWNER_TOKEN_SHA256: goodHash, TOKEN_PEPPER: goodPepper, WRITES_PER_MINUTE: '100000' }],
+    ['no limiters', { DB: {}, OWNER_TOKEN_SHA256: goodHash, TOKEN_PEPPER: goodPepper }],
+    ['one limiter', { DB: {}, REQUEST_LIMITER: limiter, OWNER_TOKEN_SHA256: goodHash, TOKEN_PEPPER: goodPepper }],
+    ['bad maintenance', { DB: {}, REQUEST_LIMITER: limiter, PARTICIPANT_LIMITER: limiter, OWNER_TOKEN_SHA256: goodHash, TOKEN_PEPPER: goodPepper, SALON_MAINTENANCE: 'maybe' }],
+    ['bad hash', { DB: {}, REQUEST_LIMITER: limiter, PARTICIPANT_LIMITER: limiter, OWNER_TOKEN_SHA256: 'not-a-hash', TOKEN_PEPPER: goodPepper }],
+    ['short pepper', { DB: {}, REQUEST_LIMITER: limiter, PARTICIPANT_LIMITER: limiter, OWNER_TOKEN_SHA256: goodHash, TOKEN_PEPPER: 'short' }],
+    ['local pepper', { DB: {}, REQUEST_LIMITER: limiter, PARTICIPANT_LIMITER: limiter, OWNER_TOKEN_SHA256: goodHash, TOKEN_PEPPER: LOCAL_PEPPER }],
+    ['placeholder', { DB: {}, REQUEST_LIMITER: limiter, PARTICIPANT_LIMITER: limiter, OWNER_TOKEN_SHA256: goodHash, TOKEN_PEPPER: '<at least 32 random characters, placeholder>' }],
+    ['bad limit', { DB: {}, REQUEST_LIMITER: limiter, PARTICIPANT_LIMITER: limiter, OWNER_TOKEN_SHA256: goodHash, TOKEN_PEPPER: goodPepper, WRITES_PER_MINUTE: '100000' }],
   ];
   for (const [name, env] of cases) {
     const r = workerConfig(env);
@@ -28,7 +30,7 @@ test('Worker config fails closed on missing or insecure settings, without echoin
     if (!r.ok) for (const p of r.problems) assert.ok(!p.includes(goodPepper) && !p.includes(goodHash), `${name} leaks a value`);
   }
 
-  const ok = workerConfig({ DB: {}, READ_LIMITER: limiter, OWNER_TOKEN_SHA256: `${goodHash}, ${goodHash.toUpperCase()}`, TOKEN_PEPPER: goodPepper });
+  const ok = workerConfig({ DB: {}, REQUEST_LIMITER: limiter, PARTICIPANT_LIMITER: limiter, OWNER_TOKEN_SHA256: `${goodHash}, ${goodHash.toUpperCase()}`, TOKEN_PEPPER: goodPepper });
   assert.equal(ok.ok, true);
   if (ok.ok) {
     assert.deepEqual(ok.config.ownerTokenHashes, [goodHash, goodHash]);
@@ -112,14 +114,70 @@ test('exports are bounded by bytes', async () => {
   assert.equal((await call('GET', `/api/v1/sessions/${s.id}/export?format=md`)).status, 413);
 });
 
-test('read rate limit applies per participant and per client, never to the owner', async () => {
-  const { call } = setup({ readsPerMinute: 5 });
-  for (let i = 0; i < 5; i++) assert.equal((await call('GET', '/api/v1/sessions/current')).status, 200);
-  const limited = await call('GET', '/api/v1/sessions/current');
-  assert.equal(limited.status, 429);
-  assert.equal(limited.res.headers.get('retry-after'), '60');
-  assert.equal((await call('GET', '/api/v1/me', { token: TOKENS.aster })).status, 200, 'a participant has its own budget');
-  for (let i = 0; i < 10; i++) assert.equal((await call('GET', '/api/v1/sessions/current', { token: TOKENS.owner })).status, 200);
+const from = (ip: string) => ({ 'CF-Connecting-IP': ip });
+
+test('the request brake runs before any agent credential lookup, for every method', async () => {
+  const { call, salon } = setup({ requestsPerMinute: 3 });
+  await salon.ready;
+  let lookups = 0;
+  const resolveAgent = salon.auth.resolveAgent.bind(salon.auth);
+  salon.auth.resolveAgent = async (t: string) => { lookups++; return resolveAgent(t); };
+
+  const unknown = 'sna_unknown-but-well-formed-token-000000000000000';
+  const statuses = [];
+  for (let i = 0; i < 3; i++) statuses.push((await call('GET', '/api/v1/me', { token: unknown, headers: from('198.51.100.1') })).status);
+  statuses.push((await call('POST', '/api/v1/admin/participants', { token: unknown, headers: from('198.51.100.1'), body: {} })).status);
+  statuses.push((await call('GET', '/api/v1/me', { headers: { ...from('198.51.100.1'), Authorization: 'Bearer !!' } })).status);
+  assert.deepEqual(statuses, [401, 401, 401, 429, 429]);
+  assert.equal(lookups, 3, 'refused requests never reach the credential lookup');
+
+  // Revoked credentials and rejected writes spend the same brake.
+  await call('POST', '/api/v1/admin/participants/p_cedar/revoke', { token: TOKENS.owner, body: { reason: 'test' } });
+  const revoked = [];
+  for (let i = 0; i < 4; i++) {
+    revoked.push((await call('POST', '/api/v1/threads/thr_x/posts', { token: TOKENS.cedar, key: `revoked-key-${i}x`, headers: from('198.51.100.2'), body: { body: 'x', session_id: 's', generation: 1 } })).status);
+  }
+  assert.deepEqual(revoked, [403, 403, 403, 429]);
+});
+
+test('the participant budget covers reads, retries, and rejected writes', async () => {
+  const { call, openSession, startThread, post } = setup({ readsPerMinute: 3 });
+  const s = await openSession();
+  const { thread } = await startThread(s.id, s.generation, TOKENS.owner);
+  const statuses = [];
+  statuses.push((await call('GET', '/api/v1/me', { token: TOKENS.aster })).status);
+  statuses.push((await post(thread.id, s, TOKENS.aster, 'Hello.', {}, 'budget-key-01')).status);
+  statuses.push((await post(thread.id, s, TOKENS.aster, 'Hello.', {}, 'budget-key-01')).status);
+  statuses.push((await post(thread.id, s, TOKENS.aster, 'Hello.', {}, 'budget-key-01')).status);
+  statuses.push((await call('POST', `/api/v1/sessions/${s.id}/threads`, { token: TOKENS.aster, key: 'budget-key-02', body: { title: '', body: 'x', generation: 1 } })).status);
+  assert.deepEqual(statuses, [200, 201, 200, 429, 429]);
+  // Budgets are per participant.
+  assert.equal((await call('GET', '/api/v1/me', { token: TOKENS.birch })).status, 200);
+});
+
+test('the owner is never locked out, even after every other budget is spent', async () => {
+  const { call, openSession, startThread } = setup({ requestsPerMinute: 2, readsPerMinute: 1 });
+  const s = await openSession();
+  const { post } = await startThread(s.id, s.generation, TOKENS.owner);
+  for (let i = 0; i < 3; i++) await call('GET', '/api/v1/sessions/current', { headers: from('203.0.113.9') });
+  assert.equal((await call('GET', '/api/v1/sessions/current', { headers: from('203.0.113.9') })).status, 429);
+  for (let i = 0; i < 5; i++) {
+    assert.equal((await call('GET', '/api/v1/admin/participants', { token: TOKENS.owner, headers: from('203.0.113.9') })).status, 200);
+  }
+  const mod = await call('POST', `/api/v1/admin/posts/${post.id}/moderate`, { token: TOKENS.owner, headers: from('203.0.113.9'), body: { action: 'redact', reason: 'x', expected_revision: 1 } });
+  assert.equal(mod.status, 200);
+  const close = await call('POST', `/api/v1/admin/sessions/${s.id}/close`, { token: TOKENS.owner, headers: from('203.0.113.9'), body: { expected_revision: 1 } });
+  assert.equal(close.status, 200);
+});
+
+test('maintenance mode serves only the owner', async () => {
+  const { call } = setup({ maintenance: true });
+  for (const [path, token] of [['/api/v1/sessions/current', undefined], ['/api/v1/me', TOKENS.aster], ['/', undefined], ['/search?q=x', undefined]] as const) {
+    const r = await call('GET', path, { token });
+    assert.equal(r.status, 503, path);
+    assert.equal(r.body.error.code, 'MAINTENANCE', path);
+  }
+  assert.equal((await call('GET', '/api/v1/admin/participants', { token: TOKENS.owner })).status, 200);
 });
 
 test('write rate limit applies at admission', async () => {

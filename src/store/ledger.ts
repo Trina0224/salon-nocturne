@@ -255,6 +255,8 @@ export class Ledger {
 
     const replayed = await this.findReceipt(actor, session.id, 'create_thread', key, digest);
     const resultId = replayed ?? threadId;
+    // A replay of someone else's commit rechecks access, like any replay.
+    if (resultId !== threadId) await this.requireAccess(actor);
     return { status: resultId === threadId ? 201 : 200, value: await this.threadWithFirstPost(resultId) };
   }
 
@@ -308,6 +310,8 @@ export class Ledger {
 
     const replayed = await this.findReceipt(actor, thread.sessionId, 'create_post', key, digest);
     const resultId = replayed ?? postId;
+    // A replay of someone else's commit rechecks access, like any replay.
+    if (resultId !== postId) await this.requireAccess(actor);
     return { status: resultId === postId ? 201 : 200, value: await this.postResult(resultId) };
   }
 
@@ -428,19 +432,27 @@ export class Ledger {
   // ---- admission internals --------------------------------------------------
 
   /**
-   * Sends one guarded batch. Returns true if it committed, false if the guard
-   * reported ALREADY_DONE (an idempotent no-op). A receipt-key collision means
-   * an identical request committed first; `onReceiptRace` confirms that.
+   * Sends one guarded batch. Returns true if it committed, false if it did not
+   * need to: the guard reported ALREADY_DONE (an idempotent no-op), or an
+   * identical request with the same Idempotency-Key committed first.
+   *
+   * The identical request can win in two ways: its receipt collides with
+   * ours (UNIQUE violation), or its commit used the last quota or rate unit
+   * (or the session closed in between), so our guard rejects. Either way the
+   * committed receipt decides, so a concurrent retry gets the original result
+   * instead of a misleading quota or rate error. Revocation is never replayed
+   * past: a REVOKED guard result always stands.
    */
-  private async admit(notFoundWhat: string, statements: Statement[], onReceiptRace?: () => Promise<string | null>): Promise<boolean> {
+  private async admit(notFoundWhat: string, statements: Statement[], committedReceipt?: () => Promise<string | null>): Promise<boolean> {
     try {
       await this.db.batch(statements);
       return true;
     } catch (err) {
       const reason = failedCheck(err);
       if (reason === 'ALREADY_DONE') return false;
+      const receiptRace = reason === null && isUniqueViolation(err, 'write_receipts');
+      if (committedReceipt && reason !== 'REVOKED' && (reason !== null || receiptRace) && (await committedReceipt())) return false;
       if (reason) throw admissionError(reason, notFoundWhat);
-      if (onReceiptRace && isUniqueViolation(err, 'write_receipts') && (await onReceiptRace())) return false;
       throw err;
     }
   }

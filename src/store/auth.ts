@@ -34,19 +34,25 @@ export class Authenticator {
   }
 
   async resolve(token: string): Promise<Resolution> {
+    const owner = await this.owner(token);
+    return owner ? { kind: 'ok', actor: owner } : this.resolveAgent(token);
+  }
+
+  /** Cheap owner check: one SHA-256 and constant-time compares, no database. */
+  async owner(token: string): Promise<Actor | null> {
     const tokenHash = await sha256Hex(token);
-    if (this.config.ownerTokenHashes.some((h) => timingSafeEqual(h, tokenHash))) {
-      return {
-        kind: 'ok',
-        actor: {
-          participantId: OWNER_PARTICIPANT_ID,
-          credentialId: OWNER_CREDENTIAL_ID,
-          displayName: 'Host',
-          role: 'owner',
-          scopes: ['read', 'post', 'admin'],
-        },
-      };
-    }
+    if (!this.config.ownerTokenHashes.some((h) => timingSafeEqual(h, tokenHash))) return null;
+    return {
+      participantId: OWNER_PARTICIPANT_ID,
+      credentialId: OWNER_CREDENTIAL_ID,
+      displayName: 'Host',
+      role: 'owner',
+      scopes: ['read', 'post', 'admin'],
+    };
+  }
+
+  /** Agent credential lookup: one database read. Callers rate-limit first. */
+  async resolveAgent(token: string): Promise<Resolution> {
     const r = await this.db.first(
       `SELECT c.id AS credential_id, c.scopes, c.revoked_at, p.id, p.display_name, p.role, p.status
        FROM credentials c JOIN participants p ON p.id = c.participant_id

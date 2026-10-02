@@ -36,8 +36,12 @@ export interface LocalOptions {
   hooks?: LedgerHooks;
   log?: (line: string) => void;
   writesPerMinute?: number;
+  /** Per-participant budget (all methods). */
   readsPerMinute?: number;
+  /** Per-client brake (all requests before credential lookup). */
+  requestsPerMinute?: number;
   exportByteCap?: number;
+  maintenance?: boolean;
 }
 
 export interface LocalSalon extends Salon {
@@ -54,13 +58,17 @@ export function createLocalSalonSync(opts: LocalOptions): LocalSalon {
     tokenPepper: LOCAL_PEPPER,
     writesPerMinute: opts.writesPerMinute ?? DEFAULTS.writesPerMinute,
     exportByteCap: opts.exportByteCap ?? DEFAULTS.exportByteCap,
+    maintenance: opts.maintenance ?? false,
   };
   const sql = new NodeSql(opts.dbPath);
   const salon = createSalon({
     db: sql,
     clock: opts.clock,
     config,
-    limiter: new MemoryReadLimiter(opts.readsPerMinute ?? 600, 60_000, opts.clock),
+    limiters: {
+      requests: new MemoryReadLimiter(opts.requestsPerMinute ?? 1200, 60_000, opts.clock),
+      participants: new MemoryReadLimiter(opts.readsPerMinute ?? 600, 60_000, opts.clock),
+    },
     hooks: opts.hooks,
     log: opts.log,
   });

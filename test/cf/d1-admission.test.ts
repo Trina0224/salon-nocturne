@@ -6,7 +6,12 @@ import assert from 'node:assert/strict';
 import { FakeClock, systemClock } from '../../src/infra/clock.ts';
 import { ApiError } from '../../src/domain/errors.ts';
 import type { Actor } from '../../src/domain/model.ts';
-import { d1Salon, OWNER_TOKEN, cleanupTemplate, wrangler } from './harness.ts';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { parseCapture } from '../../src/ops/recovery.ts';
+import { ROOT, d1Salon, OWNER_TOKEN, cleanupTemplate, migratedState, wrangler } from './harness.ts';
 
 after(cleanupTemplate);
 
@@ -252,5 +257,97 @@ test('D1: UTF-8 byte cap holds with maximal CJK posts and pagination stays gap-f
     assert.deepEqual(seen, ids);
   } finally {
     await s.dispose();
+  }
+});
+
+test('D1: concurrent identical retries at quota, rate, thread, and close boundaries replay the winner', async () => {
+  const barrier = () => {
+    let arrived = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    return async () => { if (++arrived >= 2) release(); await gate; };
+  };
+  const ids = (rs: { status: number; value: { id?: string; thread?: { id: string } } }[]) =>
+    rs.map((r) => r.value.id ?? r.value.thread!.id);
+
+  for (const variant of ['session quota', 'participant quota', 'write rate', 'thread quota', 'close'] as const) {
+    const limits = {
+      ...LIMITS,
+      ...(variant === 'session quota' ? { maxPosts: 2 } : {}),
+      ...(variant === 'participant quota' ? { maxPostsPerParticipant: 1 } : {}),
+      ...(variant === 'thread quota' ? { maxThreads: 2 } : {}),
+    };
+    const w = await world({ limits, writesPerMinute: variant === 'write rate' ? 1 : undefined });
+    try {
+      let results;
+      if (variant === 'thread quota') {
+        w.hooks.beforeAdmission = barrier();
+        results = await Promise.all([1, 2].map(() => w.s.ledger.createThread(w.agents[0]!.actor, w.session.id,
+          { title: 'Last', tags: [], body: 'B', generation: w.session.generation }, 'd1-dup-thread')));
+      } else if (variant === 'close') {
+        let arrived = 0;
+        let bothIn!: () => void;
+        const both = new Promise<void>((r) => (bothIn = r));
+        let go!: () => void;
+        const gate = new Promise<void>((r) => (go = r));
+        w.hooks.beforeAdmission = async () => { const me = ++arrived; if (arrived === 2) bothIn(); await both; if (me === 2) await gate; };
+        // Either request may reach admission first; wait for whichever was let through.
+        const first = w.post(1, 'Same.', 'd1-dup-close');
+        const second = w.post(1, 'Same.', 'd1-dup-close');
+        const { a, held } = await Promise.race([first.then((a) => ({ a, held: second })), second.then((a) => ({ a, held: first }))]);
+        await w.s.ledger.closeSession(w.owner, w.session.id, { expected_revision: 1 });
+        go();
+        results = [a, await held];
+      } else {
+        w.hooks.beforeAdmission = barrier();
+        results = await Promise.all([w.post(1, 'Same.', 'd1-dup-key'), w.post(1, 'Same.', 'd1-dup-key')]);
+      }
+      w.hooks.beforeAdmission = undefined;
+      assert.deepEqual(results.map((r) => r.status).sort(), [200, 201], variant);
+      assert.equal(new Set(ids(results as never)).size, 1, variant);
+      assert.equal(await w.count(`SELECT COUNT(*) AS n FROM write_receipts WHERE idempotency_key LIKE 'd1-dup-%'`), 1, variant);
+    } finally {
+      await w.s.dispose();
+    }
+  }
+});
+
+test('D1: session listing runs its batched stats queries (json_each, window function) correctly', async () => {
+  const w = await world({ agents: 2 });
+  try {
+    await w.post(0, 'From agent 0', 'list-k1');
+    await w.post(1, 'From agent 1', 'list-k2');
+    await w.post(0, 'Again from agent 0', 'list-k3');
+    const page = await w.s.reads.listSessions(undefined, 50);
+    assert.equal(page.items.length, 1);
+    const stats = page.items[0]!.stats;
+    assert.equal(stats.posts_published, 4);
+    assert.deepEqual(stats.speakers.map((s) => s.display_name), ['Host', 'Agent 0', 'Agent 1']);
+  } finally {
+    await w.s.dispose();
+  }
+});
+
+test('D1: the recovery capture, reapply, and verify SQL run through wrangler d1 execute --local', async () => {
+  const state = migratedState();
+  const scratch = mkdtempSync(join(tmpdir(), 'salon-recovery-sql-'));
+  try {
+    // The same commands as the runbook in docs/deployment.md, with --local.
+    const script = (...args: string[]) => execFileSync(process.execPath, ['scripts/recovery-sql.ts', ...args], { cwd: ROOT, encoding: 'utf8' }).trim();
+    const exec = (args: string[]) => wrangler(['d1', 'execute', 'DB', '--local', '--persist-to', state, ...args]);
+    const capture = parseCapture(exec(['--json', '--command', script('capture')]));
+    assert.equal(capture.max_seq, 0);
+    // A non-empty capture against an empty database: every statement must parse and no-op.
+    const file = join(scratch, 'capture.json');
+    writeFileSync(file, JSON.stringify({ ...capture, max_seq: 5, redacted_posts: ['post_gone'], revoked_participants: [{ id: 'p_gone', revoked_at: capture.captured_at }],
+      revoked_credentials: [{ id: 'cred_gone', revoked_at: capture.captured_at }], closed_sessions: [{ id: 'ses_gone', closed_at: capture.captured_at, close_reason: 'owner' }] }));
+    writeFileSync(join(scratch, 'reapply.sql'), script('reapply', file));
+    exec(['--file', join(scratch, 'reapply.sql')]);
+    const verify = JSON.parse(exec(['--json', '--command', script('verify', file)]))[0].results[0];
+    assert.deepEqual(verify, { unredacted_posts: 0, searchable_redacted_posts: 0, active_revoked_participants: 0, live_revoked_credentials: 0, reopened_sessions: 0, sequence_behind: 1 },
+      'with no session to anchor the marker, the verify step reports the sequence as behind');
+  } finally {
+    rmSync(state, { recursive: true, force: true });
+    rmSync(scratch, { recursive: true, force: true });
   }
 });

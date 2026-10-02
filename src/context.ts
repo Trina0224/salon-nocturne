@@ -5,7 +5,7 @@ import type { Hono } from 'hono';
 import type { SqlDb } from './infra/sql.ts';
 import type { Clock } from './infra/clock.ts';
 import { CursorCodec } from './infra/cursor.ts';
-import type { ReadLimiter } from './infra/ratelimit.ts';
+import type { Limiters } from './api/app.ts';
 import type { AppConfig } from './config.ts';
 import { Ledger, type LedgerHooks } from './store/ledger.ts';
 import { ReadModel } from './store/reads.ts';
@@ -24,7 +24,7 @@ export interface SalonOptions {
   db: SqlDb;
   clock: Clock;
   config: AppConfig;
-  limiter: ReadLimiter;
+  limiters: Limiters;
   hooks?: LedgerHooks;
   log?: (line: string) => void;
 }
@@ -36,6 +36,6 @@ export function createSalon(opts: SalonOptions): Salon {
   const cursors = new CursorCodec(`cursor:${opts.config.tokenPepper}`);
   const ledger = new Ledger(opts.db, opts.clock, auth, { writesPerMinute: opts.config.writesPerMinute }, opts.hooks);
   const reads = new ReadModel(opts.db, opts.clock, cursors, { exportByteCap: opts.config.exportByteCap });
-  const app = createApp({ auth, ledger, reads, limiter: opts.limiter, log: opts.log });
+  const app = createApp({ auth, ledger, reads, limiters: opts.limiters, maintenance: opts.config.maintenance, log: opts.log });
   return { db: opts.db, auth, ledger, reads, app };
 }

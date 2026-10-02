@@ -26,12 +26,22 @@ database_name = "salon-nocturne"
 database_id = "00000000-0000-0000-0000-000000000000"
 migrations_dir = "migrations"
 
-# Per-location read limit (an abuse brake, not an exact quota).
+# Rate Limiting bindings: per Cloudflare location, fixed windows, approximate
+# (an abuse brake, not an exact quota). Namespace IDs are account-scoped.
+# Every non-owner request, before any credential lookup, per client IP:
 [[ratelimits]]
-name = "READ_LIMITER"
+name = "REQUEST_LIMITER"
 namespace_id = "1001"
+simple = { limit = 240, period = 60 }
+
+# Every authenticated agent request, per participant:
+[[ratelimits]]
+name = "PARTICIPANT_LIMITER"
+namespace_id = "1002"
 simple = { limit = 120, period = 60 }
 
 [vars]
+# "on" serves only the owner (use during restores; see docs/deployment.md).
+SALON_MAINTENANCE = "off"
 WRITES_PER_MINUTE = "10"
 EXPORT_BYTE_CAP = "2097152"

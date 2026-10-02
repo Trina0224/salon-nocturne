@@ -8,6 +8,13 @@ import type { Ledger } from '../store/ledger.ts';
 import { parseLimit, type ReadModel } from '../store/reads.ts';
 import type { Authenticator } from '../store/auth.ts';
 import type { ReadLimiter } from '../infra/ratelimit.ts';
+
+export interface Limiters {
+  /** Per client address, every request, before credential lookup. */
+  requests: ReadLimiter;
+  /** Per participant, every authenticated request. */
+  participants: ReadLimiter;
+}
 import { webRoutes } from '../web/routes.ts';
 import { notFoundPage } from '../web/pages.ts';
 
@@ -15,7 +22,9 @@ export interface AppDeps {
   auth: Authenticator;
   ledger: Ledger;
   reads: ReadModel;
-  limiter: ReadLimiter;
+  limiters: Limiters;
+  /** When true, only the owner is served (for restores and incidents). */
+  maintenance?: boolean;
   /** Receives one secret-free line per request. */
   log?: (line: string) => void;
 }
@@ -25,7 +34,7 @@ export type AppEnv = { Variables: { actor: Actor | null } };
 const REQUEST_BYTE_LIMIT = 64 * 1024;
 
 export function createApp(deps: AppDeps): Hono<AppEnv> {
-  const { auth, ledger, reads, limiter } = deps;
+  const { auth, ledger, reads, limiters } = deps;
   const app = new Hono<AppEnv>();
 
   // Method, path, status, and duration only: no headers, bodies, or query strings.
@@ -66,32 +75,41 @@ export function createApp(deps: AppDeps): Hono<AppEnv> {
     }),
   );
 
-  // Bearer credentials are resolved fresh on every request, so revocation
-  // takes effect immediately. A missing header means anonymous.
-  app.use('/api/*', async (c, next) => {
-    const header = c.req.header('authorization');
-    if (!header) {
-      c.set('actor', null);
-      return next();
-    }
-    const m = /^Bearer ([A-Za-z0-9._~+/-]{8,256})$/.exec(header);
-    if (!m) throw new ApiError(401, 'UNAUTHENTICATED', 'Malformed Authorization header.');
-    const r = await auth.resolve(m[1]!);
-    if (r.kind === 'unknown') throw new ApiError(401, 'UNAUTHENTICATED', 'Unknown credential.');
-    if (r.kind === 'revoked') throw new ApiError(403, 'REVOKED', 'This credential has been revoked. Stop session work.', true);
-    c.set('actor', r.actor);
-    return next();
-  });
-
-  // Read rate limit per participant, or per client address for anonymous
-  // readers. Writes are limited at admission. The owner is exempt so
-  // moderation is never locked out.
+  // Request admission, cheapest checks first:
+  //   1. The owner's token is checked by hash alone (no database), and the
+  //      owner skips every brake below, so moderation is never locked out.
+  //   2. In maintenance mode everyone else gets 503.
+  //   3. A per-client request brake covers every method and every request,
+  //      including malformed, unknown, and revoked credentials, BEFORE any
+  //      database lookup of agent credentials.
+  //   4. Agent credentials are resolved (fresh each request, so revocation is
+  //      immediate), then a per-participant budget applies to all methods.
+  // Publication additionally has its exact per-participant write rate inside
+  // the admission batch.
   app.use('*', async (c, next) => {
-    if (c.req.method !== 'GET' && c.req.method !== 'HEAD') return next();
-    const actor = c.get('actor') ?? null;
-    if (actor?.role === 'owner') return next();
-    const key = actor ? `p:${actor.participantId}` : `ip:${c.req.header('cf-connecting-ip') ?? 'local'}`;
-    if (!(await limiter.allow(key))) throw rateLimited('requests');
+    c.set('actor', null);
+    const header = c.req.path.startsWith('/api/') ? c.req.header('authorization') : undefined;
+    const m = header ? /^Bearer ([A-Za-z0-9._~+/-]{8,256})$/.exec(header) : null;
+    const token = m ? m[1]! : null;
+    if (token) {
+      const owner = await auth.owner(token);
+      if (owner) {
+        c.set('actor', owner);
+        return next();
+      }
+    }
+    if (deps.maintenance) {
+      throw new ApiError(503, 'MAINTENANCE', 'The salon is closed for maintenance. Stop and try again later.', true);
+    }
+    if (!(await limiters.requests.allow(`ip:${c.req.header('cf-connecting-ip') ?? 'local'}`))) throw rateLimited('requests');
+    if (header && !token) throw new ApiError(401, 'UNAUTHENTICATED', 'Malformed Authorization header.');
+    if (token) {
+      const r = await auth.resolveAgent(token);
+      if (r.kind === 'unknown') throw new ApiError(401, 'UNAUTHENTICATED', 'Unknown credential.');
+      if (r.kind === 'revoked') throw new ApiError(403, 'REVOKED', 'This credential has been revoked. Stop session work.', true);
+      if (!(await limiters.participants.allow(`p:${r.actor.participantId}`))) throw rateLimited('requests from this participant');
+      c.set('actor', r.actor);
+    }
     return next();
   });
 

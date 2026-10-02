@@ -146,23 +146,41 @@ test('Worker: full local flow on D1 with real auth, assets, limits, search, expo
   }
 });
 
-test('Worker: the read limiter returns 429 for an abusive client', async () => {
+test('Worker: the request brake stops rejected-token floods before any credential lookup; the owner is exempt', async () => {
   const { worker, stop } = await startWorker({ OWNER_TOKEN_SHA256: OWNER_HASH, TOKEN_PEPPER: PEPPER });
   try {
     // The local limiter (like Cloudflare's) counts in fixed windows aligned to
-    // the clock, so a burst may straddle one boundary. Any 100 requests fit in
-    // the 120-per-minute budget; within 250 consecutive requests (well under a
-    // minute) at most two windows can each admit 120, so a 429 must appear.
+    // the clock, so a burst may straddle one boundary. Any 200 requests fit in
+    // the 240-per-minute budget; within 500 consecutive requests (well under a
+    // minute) at most two windows can each admit 240, so a 429 must appear.
+    const bogus = `sna_${'x'.repeat(43)}`;
     const statuses: number[] = [];
-    while (statuses.length < 250 && !statuses.includes(429)) {
-      statuses.push((await worker.fetch('http://127.0.0.1/api/v1/sessions/current', { headers: { 'CF-Connecting-IP': '203.0.113.7' } })).status);
+    while (statuses.length < 500 && !statuses.includes(429)) {
+      const res = await worker.fetch('http://127.0.0.1/api/v1/sessions/current', { headers: { 'CF-Connecting-IP': '203.0.113.7', Authorization: `Bearer ${bogus}` } });
+      statuses.push(res.status);
+      await res.arrayBuffer();
     }
-    assert.ok(statuses.slice(0, 100).every((s) => s === 200));
+    assert.ok(statuses.slice(0, 200).every((s) => s === 401));
     assert.ok(statuses.includes(429), `the local Rate Limiting binding eventually refuses (${statuses.length} requests)`);
-    assert.ok(statuses.length <= 241);
+    assert.ok(statuses.length <= 481);
+    // Another client IP has its own budget.
+    assert.equal((await api(worker, 'GET', '/api/v1/sessions/current')).status, 200);
     // The owner is exempt, so moderation is never locked out.
     const owner = await worker.fetch('http://127.0.0.1/api/v1/sessions/current', { headers: { 'CF-Connecting-IP': '203.0.113.7', Authorization: `Bearer ${OWNER_TOKEN}` } });
     assert.equal(owner.status, 200);
+  } finally {
+    await stop();
+  }
+});
+
+test('Worker: maintenance mode serves only the owner', async () => {
+  const { worker, stop } = await startWorker({ OWNER_TOKEN_SHA256: OWNER_HASH, TOKEN_PEPPER: PEPPER, SALON_MAINTENANCE: 'on' });
+  try {
+    const anon = await api(worker, 'GET', '/api/v1/sessions/current');
+    assert.equal(anon.status, 503);
+    assert.equal(anon.data.error.code, 'MAINTENANCE');
+    assert.equal((await worker.fetch('http://127.0.0.1/archive')).status, 503);
+    assert.equal((await api(worker, 'GET', '/api/v1/sessions/current', OWNER_TOKEN)).status, 200);
   } finally {
     await stop();
   }

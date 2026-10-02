@@ -32,7 +32,7 @@ Requires Node.js 22.18 or newer (TypeScript runs directly; no build step).
 npm install
 npm run dev          # Node prototype: http://127.0.0.1:8787 with fixture identities (owner token dev-owner-token)
 npm run demo         # in a second terminal: the whole flow, ends closed (--leave-open to watch)
-npm test             # 67 tests: Node, plus Workers-runtime tests in local workerd/D1
+npm test             # 85 tests: Node, plus Workers-runtime tests in local workerd/D1
 npm run typecheck
 ```
 

@@ -12,6 +12,8 @@ export interface AppConfig {
   writesPerMinute: number;
   /** Largest export, in UTF-8 bytes of post bodies. */
   exportByteCap: number;
+  /** Serve only the owner (restores and incidents). */
+  maintenance: boolean;
 }
 
 export const DEFAULTS = {
@@ -27,7 +29,9 @@ const PLACEHOLDER = /placeholder|example|changeme|replace|local-prototype|test/i
 
 export interface WorkerEnv {
   DB?: unknown;
-  READ_LIMITER?: unknown;
+  REQUEST_LIMITER?: unknown;
+  PARTICIPANT_LIMITER?: unknown;
+  SALON_MAINTENANCE?: string;
   OWNER_TOKEN_SHA256?: string;
   TOKEN_PEPPER?: string;
   WRITES_PER_MINUTE?: string;
@@ -50,8 +54,10 @@ function boundedInt(raw: string | undefined, fallback: number, min: number, max:
 export function workerConfig(env: WorkerEnv): ConfigResult {
   const problems: string[] = [];
   if (!env.DB) problems.push('The DB (D1) binding is missing.');
-  const limiter = env.READ_LIMITER as { limit?: unknown } | undefined;
-  if (!limiter || typeof limiter.limit !== 'function') problems.push('The READ_LIMITER rate-limit binding is missing.');
+  for (const name of ['REQUEST_LIMITER', 'PARTICIPANT_LIMITER'] as const) {
+    const limiter = env[name] as { limit?: unknown } | undefined;
+    if (!limiter || typeof limiter.limit !== 'function') problems.push(`The ${name} rate-limit binding is missing.`);
+  }
 
   const hashes = (env.OWNER_TOKEN_SHA256 ?? '').split(',').map((h) => h.trim().toLowerCase()).filter(Boolean);
   if (hashes.length === 0) problems.push('The OWNER_TOKEN_SHA256 secret is not set.');
@@ -64,6 +70,9 @@ export function workerConfig(env: WorkerEnv): ConfigResult {
   const writesPerMinute = boundedInt(env.WRITES_PER_MINUTE, DEFAULTS.writesPerMinute, 1, 120, 'WRITES_PER_MINUTE', problems);
   const exportByteCap = boundedInt(env.EXPORT_BYTE_CAP, DEFAULTS.exportByteCap, 64 * 1024, 8 * 1024 * 1024, 'EXPORT_BYTE_CAP', problems);
 
+  const mode = (env.SALON_MAINTENANCE ?? 'off').trim().toLowerCase();
+  if (mode !== 'on' && mode !== 'off') problems.push('SALON_MAINTENANCE must be "on" or "off".');
+
   if (problems.length > 0) return { ok: false, problems };
-  return { ok: true, config: { ownerTokenHashes: hashes, tokenPepper: pepper, writesPerMinute, exportByteCap } };
+  return { ok: true, config: { ownerTokenHashes: hashes, tokenPepper: pepper, writesPerMinute, exportByteCap, maintenance: mode === 'on' } };
 }

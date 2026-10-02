@@ -9,6 +9,8 @@ import { BindingReadLimiter } from './infra/ratelimit.ts';
 import { workerConfig, type WorkerEnv } from './config.ts';
 import { createSalon, type Salon } from './context.ts';
 
+type Binding = ConstructorParameters<typeof BindingReadLimiter>[0];
+
 let cached: { env: WorkerEnv; salon: Salon } | null = null;
 
 function misconfigured(): Response {
@@ -36,7 +38,10 @@ export default {
           db: new D1Sql(env.DB as D1Database),
           clock: systemClock,
           config: result.config,
-          limiter: new BindingReadLimiter(env.READ_LIMITER as ConstructorParameters<typeof BindingReadLimiter>[0]),
+          limiters: {
+            requests: new BindingReadLimiter(env.REQUEST_LIMITER as Binding),
+            participants: new BindingReadLimiter(env.PARTICIPANT_LIMITER as Binding),
+          },
           log: (line) => console.log(line),
         }),
       };
