@@ -11,6 +11,7 @@
 import { createLocalJWKSet, createRemoteJWKSet, errors as joseErrors, jwtVerify, type JWTVerifyGetKey } from 'jose';
 import type { McpConfig } from '../config.ts';
 import type { Scope } from '../domain/model.ts';
+import { isOAuthSubject } from '../domain/content.ts';
 
 /** OAuth scopes this resource understands, and the salon scope each grants. */
 export const OAUTH_SCOPES = { 'salon:read': 'read', 'salon:post': 'post' } as const satisfies Record<string, Scope>;
@@ -74,10 +75,9 @@ export class TokenVerifier {
         requiredClaims: ['exp', 'sub'],
         clockTolerance: CLOCK_TOLERANCE_SECONDS,
       });
+      // Same exact-match rule as enrollment: the subject is used unchanged.
       const subject = payload.sub;
-      if (typeof subject !== 'string' || subject.length === 0 || subject.length > 255) {
-        return { ok: false, description: 'The access token has no usable subject.' };
-      }
+      if (!isOAuthSubject(subject)) return { ok: false, description: 'The access token has no usable subject.' };
       return { ok: true, issuer: this.cfg.issuer, subject, scopes: grantedScopes(payload) };
     } catch (err) {
       if (err instanceof joseErrors.JWTExpired) return { ok: false, description: 'The access token has expired.' };

@@ -41,7 +41,7 @@ async function main(): Promise<void> {
       })
     : null;
   const mcp: McpConfig | null = issuer
-    ? { resource: `http://127.0.0.1:${port}/mcp`, issuer: issuer.issuer, authorizationServers: [issuer.issuer], jwks: { inline: issuer.jwks } }
+    ? { resource: `http://127.0.0.1:${port}/mcp`, issuer: issuer.issuer, authorizationServers: [issuer.issuer], jwks: { inline: issuer.jwks }, allowedOrigins: [`http://127.0.0.1:${port}`] }
     : null;
 
   const salon = await createLocalSalon({ dbPath, clock: systemClock, mcp, log: (line) => console.log(line) });

@@ -22,7 +22,7 @@ export async function mcpWorld(opts: Parameters<typeof setup>[0] = {}) {
       { subject: 'synthetic-stranger', label: 'Synthetic stranger' },
     ],
   });
-  const mcp: McpConfig = { resource: RESOURCE, issuer: ISSUER, authorizationServers: [ISSUER], jwks: { inline: issuer.jwks } };
+  const mcp: McpConfig = { resource: RESOURCE, issuer: ISSUER, authorizationServers: [ISSUER], jwks: { inline: issuer.jwks }, allowedOrigins: ['https://salon.test', 'https://allowed-client.test'] };
   const ctx = setup({ ...opts, mcp });
   await ctx.salon.ready;
 

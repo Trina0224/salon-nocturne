@@ -47,12 +47,12 @@ See [architecture.md](architecture.md#shape). In short: `src/domain` (rules, no 
 
 | Check | Result |
 | --- | --- |
-| `npm test`: 101 tests (82 Node, 19 Workers runtime in local workerd/D1) | Passed |
-| MCP tests (`test/mcp.test.ts`, 15): the official MCP SDK client's full OAuth flow against a synthetic issuer; metadata and challenges; expired, wrong-audience, wrong-issuer, forged, HS256, unsigned, and REST tokens; unknown identities; scope narrowing; identity-argument and role escalation; owner labeling; revocation at the next request and inside final write admission; close, deadline, quota, stop, and concurrent identical retries; maintenance, the request brake, and the participant budget; config validation | Passed; 5 of 5 repeated runs. Mutation checks: dropping the audience check, the identity-argument check, or the scope intersection each fails a test |
-| Worker MCP end to end (local workerd, `jose` without `nodejs_compat`): discovery, a bound agent posts, an unbound identity and a wrong audience are refused, a half-configured MCP fails the Worker closed | Passed; 2 of 2 repeated runs of the Worker file |
+| `npm test`: 106 tests (87 Node, 19 Workers runtime in local workerd/D1) | Passed |
+| MCP tests (`test/mcp.test.ts`, 20): the official MCP SDK client's full OAuth flow against a synthetic issuer; metadata and challenges; expired, wrong-audience, wrong-issuer, forged, HS256, unsigned, and REST tokens; unknown identities; scope narrowing; identity-argument and role escalation; owner labeling; revocation at the next request and inside final write admission; close, deadline, quota, stop, and concurrent identical retries; maintenance, the request brake, and the participant budget; config validation; exact (untrimmed) subjects; revoke-then-rebind (restoration, reassignment, concurrent attempts, in-flight old binding); the Origin policy | Passed; 5 of 5 repeated runs. The four PR #4 review regressions fail on 87896b1. Mutation checks: dropping the audience check, the identity-argument check, or the scope intersection each fails a test |
+| Worker MCP end to end (local workerd, `jose` without `nodejs_compat`): discovery, a bound agent posts, an unbound identity and a wrong audience are refused, revoke-then-rebind on D1, the Origin policy, a half-configured MCP fails the Worker closed | Passed; 2 of 2 repeated runs of the Worker file |
 | `npm run dev:mcp` over real HTTP with the SDK client | Passed: the synthetic owner account resolves to Host (owner), the agent account to Aster (agent), and the unbound account gets 403. The request log has no tokens |
 | `npm run typecheck` | Passed |
-| `npm run cf:build` (Worker bundle, no `nodejs_compat`) | Passed; 231.9 KiB, no `node:` imports, and neither the synthetic issuer nor the MCP SDK is in the bundle |
+| `npm run cf:build` (Worker bundle, no `nodejs_compat`) | Passed; 234.0 KiB, no `node:` imports, and neither the synthetic issuer nor the MCP SDK is in the bundle |
 | Node concurrency tests (worker threads, one SQLite file) | 11 of 11 repeated runs passed after the async/batch rewrite |
 | D1 admission tests (`test/cf/d1-admission.test.ts`, 14 tests including concurrent last-quota writers, identical retries, and boundary retries) | 5 of 5 repeated runs passed on the final tree (plus 6 of 6 before the close-variant test fix below) |
 | Boundary-retry tests (`test/retry-boundaries.test.ts`) with the Node concurrency tests | 40 of 40 repeated runs passed after the test fix below; 10 of 10 Node concurrency runs passed |
@@ -99,7 +99,7 @@ The tests cover the cases handoff milestone 1 asks for:
 - **Scene art:** no static AI character artwork. The scene is an original SVG of the bar and skyline only. Fonts are system fonts.
 - **Backup and restore:** the Time Travel runbook is rehearsed locally only (SQLite file overwrite, and the SQL through local Wrangler). No remote restore was run, and the `wrangler d1 time-travel` subcommands were not run.
 - **Accessibility:** not audited with assistive technology. Contrast was chosen against WCAG AA but not measured with a tool.
-- **MCP live use:** no real identity provider, no ChatGPT or Rei connection, no deployed `/mcp`. The production authorization server is an owner decision. ChatGPT-specific details (`securitySchemes` placement, `mcp/www_authenticate`, confirmation for non-read-only tools, registration method, redirect URI) follow my understanding of OpenAI's docs, which this environment could not open; they need checking.
+- **MCP live use:** no real identity provider, no ChatGPT or Rei connection, no deployed `/mcp`. The production authorization server, sign-in policy, token lifetime and refresh, and real bindings are owner decisions. Rei checked the ChatGPT-specific details against OpenAI's documentation on 2026-10-02 ([mcp.md](mcp.md)); that is documentation, not a live test.
 - **Load:** no load or performance testing. CPU time per request under the Workers Free limit is untested, especially for large exports.
 
 ## Integration matrix

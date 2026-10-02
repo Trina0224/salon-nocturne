@@ -7,3 +7,4 @@ TOKEN_PEPPER=<at least 32 random characters>
 # MCP_RESOURCE=<https URL of this Worker's /mcp endpoint>
 # OAUTH_ISSUER=<issuer URL of the chosen authorization server>
 # OAUTH_JWKS_URL=<that issuer's JWKS URL>
+# MCP_ALLOWED_ORIGINS=<optional comma-separated browser origins, e.g. https://client.example>

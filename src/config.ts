@@ -32,6 +32,12 @@ export interface McpConfig {
   authorizationServers: string[];
   /** Where the issuer's signing keys come from. */
   jwks: { url: string } | { inline: PublicJwks };
+  /**
+   * Browser origins allowed to call /mcp. A request with an Origin header
+   * must match one exactly; requests without Origin (server-side clients)
+   * are allowed. Always includes the endpoint's own origin.
+   */
+  allowedOrigins: string[];
 }
 
 export const DEFAULTS = {
@@ -59,9 +65,10 @@ export interface WorkerEnv {
   OAUTH_AUTHORIZATION_SERVER?: string;
   OAUTH_JWKS_URL?: string;
   OAUTH_JWKS?: string;
+  MCP_ALLOWED_ORIGINS?: string;
 }
 
-const MCP_VARS = ['MCP_RESOURCE', 'OAUTH_ISSUER', 'OAUTH_AUTHORIZATION_SERVER', 'OAUTH_JWKS_URL', 'OAUTH_JWKS'] as const;
+const MCP_VARS = ['MCP_RESOURCE', 'OAUTH_ISSUER', 'OAUTH_AUTHORIZATION_SERVER', 'OAUTH_JWKS_URL', 'OAUTH_JWKS', 'MCP_ALLOWED_ORIGINS'] as const;
 const PRIVATE_JWK_MEMBERS = ['d', 'p', 'q', 'dp', 'dq', 'qi', 'k'];
 
 /** https, or http only on a loopback host (local development). */
@@ -120,8 +127,17 @@ export function mcpConfig(env: Pick<WorkerEnv, (typeof MCP_VARS)[number]>, probl
       jwks = { inline: { keys: keys as Record<string, unknown>[] } };
     }
   }
+  const extraOrigins = (env.MCP_ALLOWED_ORIGINS ?? '').split(',').map((o) => o.trim()).filter(Boolean);
+  for (const o of extraOrigins) {
+    const u = secureUrl(o);
+    if (!u || u.origin !== o) {
+      problems.push('MCP_ALLOWED_ORIGINS must be comma-separated origins (scheme, host, optional port; no path or trailing slash).');
+      break;
+    }
+  }
   if (problems.length > before || !resource || !jwks) return null;
-  return { resource: resource.href, issuer, authorizationServers: [asRaw], jwks };
+  const allowedOrigins = [...new Set([resource.origin, ...extraOrigins])];
+  return { resource: resource.href, issuer, authorizationServers: [asRaw], jwks, allowedOrigins };
 }
 
 export type ConfigResult = { ok: true; config: AppConfig } | { ok: false; problems: string[] };

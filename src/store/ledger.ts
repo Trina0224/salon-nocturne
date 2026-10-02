@@ -20,6 +20,7 @@ import {
   validateLimits,
   validateTags,
   validateTitle,
+  validateOAuthSubject,
 } from '../domain/content.ts';
 import { HARD_CAPS, toIso, type Actor, type Scope, type WriteOperation } from '../domain/model.ts';
 import { displayNames, loadPost, loadSession, loadThread, postFromRow } from './rows.ts';
@@ -439,7 +440,7 @@ export class Ledger {
     this.requireOwner(actor);
     rejectFields(raw, ['issuer', 'scopes', 'role']);
     const participantId = validateTitle(raw.participant_id, 'participant_id', 64);
-    const subject = validateTitle(raw.subject, 'subject', 255);
+    const subject = validateOAuthSubject(raw.subject);
     const label = validateTitle(raw.label, 'label', 60);
     const confirmOwner = raw.confirm_owner === undefined ? false : raw.confirm_owner;
     if (typeof confirmOwner !== 'boolean') throw invalid('confirm_owner must be a boolean.');
@@ -452,6 +453,7 @@ export class Ledger {
     const bindingId = newId('cred');
     const gid = newId('adm');
     const now = this.clock.sqlNow();
+    await this.hooks.beforeAdmission?.();
     try {
       await this.admit('Participant', [
         new Query()
@@ -460,6 +462,14 @@ export class Ledger {
                                               WHEN p.status = 'revoked' THEN 'PARTICIPANT_REVOKED' END`, gid)
           .add(`FROM (SELECT ${now.sql} AS at) n LEFT JOIN participants p ON p.id = ?`, ...now.params, participantId)
           .build(),
+        // Rebinding after revocation: a revoked binding for this identity
+        // gives up the digest (it keeps its ID, participant, and revocation;
+        // it is never reactivated), so the new row below, with a fresh ID,
+        // can take it. An active binding is left alone, so the insert then
+        // violates the digest's uniqueness and the whole batch rolls back:
+        // at most one active binding per identity, even under concurrency.
+        stmt(`UPDATE credentials SET token_digest = 'retired:' || id
+              WHERE token_digest = ? AND kind = 'oauth' AND revoked_at IS NOT NULL`, digest),
         stmt(`INSERT INTO credentials (id, participant_id, token_digest, scopes, label, created_at, kind)
               SELECT ?, ?, ?, ?, ?, at, 'oauth' FROM admissions WHERE id = ?`,
           bindingId, participantId, digest, JSON.stringify(OAUTH_BINDING_SCOPES), label, gid),
@@ -468,7 +478,7 @@ export class Ledger {
       ]);
     } catch (err) {
       if (isUniqueViolation(err, 'credentials')) {
-        throw new ApiError(409, 'IDENTITY_ALREADY_BOUND', 'This identity is already bound. Revoke the existing binding first.');
+        throw new ApiError(409, 'IDENTITY_ALREADY_BOUND', 'This identity has an active binding. Revoke it first to move or replace it.');
       }
       throw err;
     }

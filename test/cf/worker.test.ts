@@ -226,6 +226,20 @@ test('Worker: MCP over OAuth in workerd: discovery, a bound agent posts, an unbo
     assert.equal(made.body.result.structuredContent.post.author.display_name, 'Synthetic Rei');
 
     assert.equal((await rpc(await mint('synthetic-stranger'), 'tools/list')).status, 403);
+    // Revoke then rebind on D1: a fresh binding takes over; the old one stays revoked.
+    assert.equal((await api(worker, 'POST', `/api/v1/admin/credentials/${bind.data.binding.id}/revoke`, OWNER_TOKEN, {})).status, 200);
+    assert.equal((await rpc(t, 'tools/list')).status, 403);
+    const rebind = await api(worker, 'POST', '/api/v1/admin/oauth-bindings', OWNER_TOKEN,
+      { participant_id: agent.data.participant.id, subject: 'synthetic-rei', label: 'synthetic again' });
+    assert.equal(rebind.status, 201);
+    assert.notEqual(rebind.data.binding.id, bind.data.binding.id);
+    assert.equal((await rpc(t, 'tools/list')).status, 200);
+    // Origin policy.
+    const fromOrigin = (origin: string) => worker.fetch(resource, { method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${t}`, Origin: origin }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'ping' }) });
+    assert.equal((await fromOrigin('https://untrusted-origin.invalid')).status, 403);
+    assert.equal((await fromOrigin('null')).status, 403);
+    assert.equal((await fromOrigin('http://127.0.0.1')).status, 200);
     assert.equal((await rpc(await mint('synthetic-rei', 'https://elsewhere.test/mcp'), 'tools/list')).status, 401);
     // Half-configured MCP fails the whole Worker closed.
     const half = await startWorker({ OWNER_TOKEN_SHA256: OWNER_HASH, TOKEN_PEPPER: PEPPER, MCP_RESOURCE: resource });

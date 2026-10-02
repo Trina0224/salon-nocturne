@@ -375,3 +375,134 @@ test('MCP is off unless configured: no endpoint, no metadata, and binding creati
   assert.equal(r.status, 409);
   assert.equal(r.body.error.code, 'OAUTH_NOT_CONFIGURED');
 });
+
+test('MCP: subjects are bound and matched exactly, never trimmed', async () => {
+  const w = await mcpWorld();
+  const bind = (body: Record<string, unknown>) => w.call('POST', '/api/v1/admin/oauth-bindings', { token: TOKENS.owner, body });
+  // The distinct, untrimmed subject has no authority before it is bound.
+  assert.equal((await w.rpc(await w.token('synthetic-space'), 'tools/list')).status, 403);
+  assert.equal((await bind({ participant_id: 'p_host', subject: ' synthetic-space ', label: 'padded', confirm_owner: true })).status, 201);
+  // Only the exact approved subject gets the host; the trimmed one is still unknown.
+  assert.equal((await w.rpc(await w.token('synthetic-space'), 'tools/list')).status, 403);
+  const padded = (await w.tool(await w.token(' synthetic-space '), 'whoami')).data;
+  assert.deepEqual(padded.participant, { id: 'p_host', display_name: 'Host', role: 'owner' });
+
+  // The trimmed subject is a different identity and can be bound separately, to an agent.
+  const spacer = await w.call('POST', '/api/v1/admin/participants', { token: TOKENS.owner, body: { display_name: 'Spacer' } });
+  assert.equal((await bind({ participant_id: spacer.body.participant.id, subject: 'synthetic-space', label: 'plain' })).status, 201);
+  const plain = (await w.tool(await w.token('synthetic-space'), 'whoami')).data;
+  assert.deepEqual(plain.participant, { id: spacer.body.participant.id, display_name: 'Spacer', role: 'agent' });
+  // Attribution follows the exact subject.
+  const s = await w.openSession();
+  const post = (await w.tool(await w.token(' synthetic-space '), 'create_thread', { session_id: s.id, generation: s.generation, title: 'Exact', body: 'As host.', idempotency_key: 'exact-key-0001' })).data;
+  assert.equal(post.post.author.id, 'p_host');
+  const agentPost = (await w.tool(await w.token('synthetic-space'), 'create_thread', { session_id: s.id, generation: s.generation, title: 'Exact 2', body: 'As agent.', idempotency_key: 'exact-key-0002' })).data;
+  assert.equal(agentPost.post.author.id, spacer.body.participant.id);
+
+  // Unsupported subjects are refused, not transformed, in both places.
+  for (const subject of ['', 'line\nbreak', 'tab\there', 'x'.repeat(256)]) {
+    assert.equal((await bind({ participant_id: w.reiId, subject, label: 'bad' })).status, 400, JSON.stringify(subject));
+  }
+  assert.equal((await w.rpc(await w.token('line\nbreak'), 'tools/list')).status, 401);
+});
+
+test('MCP: a revoked binding can be replaced with a fresh one, never reactivated', async () => {
+  const w = await mcpWorld();
+  const bind = (participant_id: string, label = 'again') =>
+    w.call('POST', '/api/v1/admin/oauth-bindings', { token: TOKENS.owner, body: { participant_id, subject: 'synthetic-rei', label } });
+  const revoke = (id: string) => w.call('POST', `/api/v1/admin/credentials/${id}/revoke`, { token: TOKENS.owner, body: {} });
+
+  // While a binding is active, a second one for the same identity is refused.
+  const active = await bind(w.reiId);
+  assert.equal(active.status, 409);
+  assert.match(active.body.error.message, /active binding/);
+
+  // Same-participant restoration: a new ID; the old row stays revoked.
+  assert.equal((await revoke(w.reiBindingId)).status, 200);
+  assert.equal((await w.rpc(await w.token('synthetic-rei'), 'tools/list')).status, 403);
+  const restored = await bind(w.reiId, 'restored');
+  assert.equal(restored.status, 201);
+  assert.notEqual(restored.body.binding.id, w.reiBindingId);
+  assert.equal((await w.tool(await w.token('synthetic-rei'), 'whoami')).data.participant.id, w.reiId);
+  const list = (await w.call('GET', '/api/v1/admin/oauth-bindings', { token: TOKENS.owner })).body.bindings as { id: string; revoked_at: string | null }[];
+  assert.ok(list.find((b) => b.id === w.reiBindingId)!.revoked_at, 'the old binding is still revoked');
+  assert.equal(list.find((b) => b.id === restored.body.binding.id)!.revoked_at, null);
+  const old = w.raw.prepare('SELECT token_digest, revoked_at FROM credentials WHERE id = ?').get(w.reiBindingId) as { token_digest: string; revoked_at: string };
+  assert.equal(old.token_digest, `retired:${w.reiBindingId}`);
+
+  // Reassignment: revoke, then bind the same identity to another participant.
+  await revoke(restored.body.binding.id);
+  const moved = await bind('p_aster', 'moved');
+  assert.equal(moved.status, 201);
+  assert.equal((await w.tool(await w.token('synthetic-rei'), 'whoami')).data.participant.display_name, 'Aster');
+
+  // Concurrent replacements after a revocation: exactly one wins.
+  await revoke(moved.body.binding.id);
+  let arrived = 0;
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  w.hooks.beforeAdmission = async () => {
+    if (++arrived === 2) release();
+    await gate;
+  };
+  const results = await Promise.all([bind(w.reiId, 'race-a'), bind('p_birch', 'race-b')]);
+  w.hooks.beforeAdmission = undefined;
+  assert.deepEqual(results.map((r) => r.status).sort(), [201, 409]);
+  const activeRows = w.raw.prepare("SELECT COUNT(*) AS n FROM credentials WHERE kind = 'oauth' AND revoked_at IS NULL AND token_digest NOT LIKE 'retired:%' AND label LIKE 'race-%'").get() as { n: number };
+  assert.equal(Number(activeRows.n), 1);
+});
+
+test('MCP: an in-flight request from a revoked binding stays revoked after the identity is rebound', async () => {
+  const w = await mcpWorld();
+  const s = await w.openSession();
+  const t = await w.token('synthetic-rei');
+  const { thread } = (await w.tool(t, 'create_thread', { session_id: s.id, generation: s.generation, title: 'In flight', body: 'Start.', idempotency_key: 'flight-key-0001' })).data;
+  // Between this request's checks and its admission batch, the owner revokes
+  // the binding and immediately binds the same identity again.
+  w.hooks.beforeAdmission = async () => {
+    w.hooks.beforeAdmission = undefined;
+    await w.call('POST', `/api/v1/admin/credentials/${w.reiBindingId}/revoke`, { token: TOKENS.owner, body: {} });
+    const again = await w.call('POST', '/api/v1/admin/oauth-bindings', { token: TOKENS.owner, body: { participant_id: w.reiId, subject: 'synthetic-rei', label: 'replacement' } });
+    assert.equal(again.status, 201);
+  };
+  const late = await w.tool(t, 'create_post', { thread_id: thread.id, session_id: s.id, generation: s.generation, body: 'Old authority.', idempotency_key: 'flight-key-0002' });
+  assert.equal(late.data.error.code, 'REVOKED');
+  assert.equal(Number(w.raw.prepare("SELECT COUNT(*) AS n FROM posts WHERE body = 'Old authority.'").get()!.n), 0);
+  // A new request resolves the new binding and may post.
+  const fresh = await w.tool(t, 'create_post', { thread_id: thread.id, session_id: s.id, generation: s.generation, body: 'New authority.', idempotency_key: 'flight-key-0003' });
+  assert.equal(fresh.isError, false);
+});
+
+test('MCP: Origin policy: absent and allowed origins pass; invalid, null, and malformed origins get 403 before any token work', async () => {
+  const w = await mcpWorld();
+  const t = await w.token('synthetic-rei');
+  const call = (origin: string | undefined, token: string | null = t) => w.rpc(token, 'tools/call', { name: 'whoami', arguments: {} }, origin === undefined ? {} : { Origin: origin });
+  assert.equal((await call(undefined)).status, 200, 'server-side clients send no Origin');
+  assert.equal((await call('https://salon.test')).status, 200, 'own origin');
+  assert.equal((await call('https://allowed-client.test')).status, 200, 'configured origin');
+  for (const bad of ['https://untrusted-origin.invalid', 'null', 'not a url', 'https://salon.test/', 'https://salon.test:444', 'http://salon.test', 'https://SALON.test.evil', '']) {
+    const r = await call(bad);
+    assert.equal(r.status, 403, JSON.stringify(bad));
+    assert.match(r.body.error.message, /Origin/);
+  }
+  // Checked before authentication, so a bad Origin learns nothing about tokens.
+  assert.equal((await call('https://untrusted-origin.invalid', null)).status, 403);
+  const get = await w.fetchImpl(RESOURCE, { headers: { Origin: 'null' } });
+  assert.equal(get.status, 403);
+});
+
+test('MCP config: allowed origins must be bare origins and count toward all-or-nothing', () => {
+  const jwks = JSON.stringify({ keys: [{ kty: 'EC', crv: 'P-256', x: 'AA', y: 'AA' }] });
+  const ok = { MCP_RESOURCE: 'https://salon.example/mcp', OAUTH_ISSUER: 'https://auth.example', OAUTH_JWKS: jwks };
+  const run = (env: Record<string, string>) => {
+    const problems: string[] = [];
+    return { cfg: mcpConfig(env, problems), problems };
+  };
+  assert.deepEqual(run(ok).cfg!.allowedOrigins, ['https://salon.example']);
+  assert.deepEqual(run({ ...ok, MCP_ALLOWED_ORIGINS: 'https://chat.example, https://other.example:8443' }).cfg!.allowedOrigins,
+    ['https://salon.example', 'https://chat.example', 'https://other.example:8443']);
+  for (const bad of ['https://chat.example/', 'https://chat.example/path', 'null', 'chat.example', 'http://chat.example']) {
+    assert.ok(run({ ...ok, MCP_ALLOWED_ORIGINS: bad }).problems.length > 0, bad);
+  }
+  assert.ok(run({ MCP_ALLOWED_ORIGINS: 'https://chat.example' }).problems.length > 0, 'alone it is a partial configuration');
+});

@@ -82,6 +82,19 @@ export function mcpRoutes(deps: McpDeps): Hono<AppEnv> {
   app.get(`/.well-known/oauth-protected-resource${resourcePath}`, metadata);
   app.get('/.well-known/oauth-protected-resource', metadata);
 
+  // Origin policy (MCP Streamable HTTP security requirement, against DNS
+  // rebinding and cross-site use from browsers). Server-side clients send no
+  // Origin and are allowed. A present Origin must exactly equal an allowed
+  // origin; "null", malformed values, and anything else get 403 before any
+  // token work.
+  app.use(resourcePath, async (c, next) => {
+    const origin = c.req.header('origin');
+    if (origin !== undefined && !originAllowed(origin, config.allowedOrigins)) {
+      return refuse(c, 403, 'Requests from this Origin are not allowed.');
+    }
+    return next();
+  });
+
   // No server-initiated stream and no MCP session to delete.
   app.on(['GET', 'DELETE'], resourcePath, (c) => {
     c.header('Allow', 'POST');
@@ -159,6 +172,17 @@ export function mcpRoutes(deps: McpDeps): Hono<AppEnv> {
   );
 
   return app;
+}
+
+/** Exact match against an allowed origin, after confirming it is a bare, well-formed origin. */
+export function originAllowed(origin: string, allowed: readonly string[]): boolean {
+  let u: URL;
+  try {
+    u = new URL(origin);
+  } catch {
+    return false;
+  }
+  return u.origin === origin && allowed.includes(origin);
 }
 
 async function dispatch(config: McpConfig, ctx: ToolContext, req: RpcRequest & { id: RpcId }) {
