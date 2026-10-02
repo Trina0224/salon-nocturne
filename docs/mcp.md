@@ -67,7 +67,7 @@ Tool descriptions are written per connection. For an owner-bound connection, wri
 
 - **`securitySchemes`.** Declaring it on the tool is the normal form; `_meta.securitySchemes` is a backward-compatibility mirror. Both are emitted.
 - **Step-up.** An `isError` result with `_meta["mcp/www_authenticate"]` (a string or an array) that includes `error` and `error_description` triggers the authentication UI. The salon's challenge does both.
-- **Confirmation.** In Developer mode, write actions require confirmation *by default*. Users can remember choices and change permissions, so the salon must not assume a prompt before every write. `readOnlyHint` is respected; tools without hints are treated as writes. `openWorldHint` and `destructiveHint` describe behavior; they guarantee no prompt, and annotations never enforce authorization. The salon's own checks do that.
+- **Confirmation.** In Developer mode, write actions require confirmation *by default*. Users can remember choices and change permissions, so the salon must not assume a prompt before every write. `readOnlyHint` is respected; tools without hints are treated as writes. `openWorldHint` and `destructiveHint` describe behavior; they guarantee neither a prompt nor its absence, and annotations never enforce authorization. The salon's own checks do that.
 - **Transport.** Stateless operation, JSON POST responses, and 405 on GET are allowed by the MCP transport specification; sessions and SSE are optional.
 
 ## Authentication
@@ -92,7 +92,7 @@ Salon Nocturne is an OAuth **resource server** only. It never shows a login page
 A valid token only proves "this issuer vouches for this subject". **The participant and role come from a server-side binding the owner creates.**
 
 - **Storage.** A binding is a row in `credentials` with `kind = 'oauth'`. Its digest is `HMAC(TOKEN_PEPPER, issuer + subject)`, so the external account ID is never stored, listed, or echoed.
-- **Exact subjects.** Subjects are compared exactly, as JWT StringOrURI values (RFC 7519 §2): never trimmed, case-folded, or normalized. `" synthetic-space "` and `"synthetic-space"` are different identities. Enrollment and token validation apply the same rule (1–255 characters, no control characters); anything else is refused in both places, never transformed.
+- **Exact subjects.** Subjects are compared exactly, as JWT StringOrURI values (RFC 7519 §2): never trimmed, case-folded, or normalized. `" synthetic-space "` and `"synthetic-space"` are different identities. Enrollment and token validation apply the same rule (1–255 characters, no control characters, well-formed Unicode with no unpaired surrogates); anything else is refused in both places, never transformed or replaced with U+FFFD.
 - **Creating one.** Only the owner can create bindings, through REST with the owner token:
   ```
   POST /api/v1/admin/oauth-bindings   { participant_id, subject, label [, confirm_owner: true] }

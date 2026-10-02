@@ -506,3 +506,38 @@ test('MCP config: allowed origins must be bare origins and count toward all-or-n
   }
   assert.ok(run({ MCP_ALLOWED_ORIGINS: 'https://chat.example' }).problems.length > 0, 'alone it is a partial configuration');
 });
+
+test('MCP: ill-formed Unicode subjects are refused in enrollment and tokens; valid U+FFFD and surrogate pairs stay distinct', async () => {
+  const w = await mcpWorld();
+  const bind = (participant_id: string, subject: string, extra: Record<string, unknown> = {}) =>
+    w.call('POST', '/api/v1/admin/oauth-bindings', { token: TOKENS.owner, body: { participant_id, subject, label: 'unicode', ...extra } });
+  const whoami = async (subject: string) => w.rpc(await w.token(subject), 'tools/call', { name: 'whoami', arguments: {} });
+
+  // Lone high, lone low, and reversed surrogates: refused at enrollment, never repaired to U+FFFD.
+  for (const subject of ['synthetic-\uD800', 'synthetic-\uDBFF', 'synthetic-\uDC00', 'synthetic-\uDFFF', 'synthetic-\uDC00\uD800', '\uD83C']) {
+    const r = await bind('p_host', subject, { confirm_owner: true });
+    assert.equal(r.status, 400, JSON.stringify(subject));
+    assert.match(r.body.error.message, /exact token subject/);
+  }
+  assert.equal(Number(w.raw.prepare("SELECT COUNT(*) AS n FROM credentials WHERE kind = 'oauth' AND label = 'unicode'").get()!.n), 0);
+
+  // A real U+FFFD in a subject is a valid, distinct identity.
+  const spacer = await w.call('POST', '/api/v1/admin/participants', { token: TOKENS.owner, body: { display_name: 'Replacement' } });
+  assert.equal((await bind(spacer.body.participant.id, 'synthetic-�')).status, 201);
+  assert.equal((await whoami('synthetic-�')).body.result.structuredContent.participant.display_name, 'Replacement');
+
+  // Tokens whose subject is ill-formed are invalid; they never reach the U+FFFD identity.
+  for (const subject of ['synthetic-\uD800', 'synthetic-\uD801', 'synthetic-\uDC00']) {
+    const r = await whoami(subject);
+    assert.equal(r.status, 401, JSON.stringify(subject));
+    assert.match(r.headers.get('www-authenticate') ?? '', /error="invalid_token"/);
+  }
+
+  // Well-formed surrogate pairs (emoji) are accepted and matched exactly.
+  assert.equal((await bind('p_host', 'synthetic-\u{1F3B7}', { confirm_owner: true })).status, 201);
+  assert.deepEqual((await whoami('synthetic-\u{1F3B7}')).body.result.structuredContent.participant, { id: 'p_host', display_name: 'Host', role: 'owner' });
+  assert.equal((await whoami('synthetic-\u{1F3B8}')).status, 403, 'a different emoji is a different identity');
+  assert.equal((await whoami('synthetic-\uD83C')).status, 401, 'half a pair is ill-formed');
+  // The whitespace exact-match rule still holds alongside it.
+  assert.equal((await whoami(' synthetic-\u{1F3B7} ')).status, 403);
+});

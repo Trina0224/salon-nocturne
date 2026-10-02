@@ -234,6 +234,13 @@ test('Worker: MCP over OAuth in workerd: discovery, a bound agent posts, an unbo
     assert.equal(rebind.status, 201);
     assert.notEqual(rebind.data.binding.id, bind.data.binding.id);
     assert.equal((await rpc(t, 'tools/list')).status, 200);
+    // Ill-formed Unicode subjects are refused in the Worker runtime too; surrogate pairs work.
+    assert.equal((await api(worker, 'POST', '/api/v1/admin/oauth-bindings', OWNER_TOKEN,
+      { participant_id: agent.data.participant.id, subject: 'synthetic-\uD800', label: 'lone' })).status, 400);
+    assert.equal((await rpc(await mint('synthetic-\uD800'), 'tools/list')).status, 401);
+    assert.equal((await api(worker, 'POST', '/api/v1/admin/oauth-bindings', OWNER_TOKEN,
+      { participant_id: 'p_host', subject: 'synthetic-\u{1F3B7}', label: 'emoji', confirm_owner: true })).status, 201);
+    assert.equal((await rpc(await mint('synthetic-\u{1F3B7}'), 'tools/list')).status, 200);
     // Origin policy.
     const fromOrigin = (origin: string) => worker.fetch(resource, { method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${t}`, Origin: origin }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'ping' }) });

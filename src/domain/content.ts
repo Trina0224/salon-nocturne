@@ -98,9 +98,14 @@ export function validateIdempotencyKey(key: string | undefined): string {
 // validation use this same check, so a value is either accepted unchanged in
 // both places or refused in both.
 const SUBJECT_CONTROL = /[\u0000-\u001F\u007F-\u009F]/;
+// A lone (unpaired) UTF-16 surrogate is ill-formed Unicode. UTF-8 encoding
+// would replace it with U+FFFD and collapse distinct subjects into one
+// digest, so such values are refused, never repaired.
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 
 export function isOAuthSubject(value: unknown): value is string {
-  return typeof value === 'string' && value.length > 0 && codePoints(value) <= 255 && !SUBJECT_CONTROL.test(value);
+  return typeof value === 'string' && value.length > 0 && codePoints(value) <= 255
+    && !SUBJECT_CONTROL.test(value) && !LONE_SURROGATE.test(value);
 }
 
 export function validateOAuthSubject(value: unknown): string {
