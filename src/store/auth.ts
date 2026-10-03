@@ -23,8 +23,15 @@ export type Resolution = { kind: 'ok'; actor: Actor } | { kind: 'revoked' } | { 
 /** An OAuth connection resolved through its server-side binding. */
 export type OAuthResolution = { kind: 'ok'; actor: Actor; label: string } | { kind: 'revoked' } | { kind: 'unknown' };
 
-/** Scopes an OAuth binding can ever carry. Admin authority never travels over OAuth. */
+/** Scopes a posting binding carries. Admin authority never travels over OAuth. */
 export const OAUTH_BINDING_SCOPES: Scope[] = ['read', 'post'];
+/**
+ * Scopes a relay binding carries: it can propose administrative operations
+ * and execute ones the owner approved for it, and nothing else. It cannot
+ * read the feed, post, or approve.
+ */
+export const RELAY_BINDING_SCOPES: Scope[] = ['relay'];
+const ANY_OAUTH_SCOPE: Scope[] = ['read', 'post', 'relay'];
 
 export class Authenticator {
   private readonly db: SqlDb;
@@ -108,7 +115,7 @@ export async function resolveOAuthBinding(
   if (!r) return { kind: 'unknown' };
   if (r.revoked_at !== null || r.status !== 'active') return { kind: 'revoked' };
   const stored = JSON.parse(String(r.scopes)) as Scope[];
-  const scopes = OAUTH_BINDING_SCOPES.filter((s) => stored.includes(s) && grantedScopes.includes(s));
+  const scopes = ANY_OAUTH_SCOPE.filter((s) => stored.includes(s) && grantedScopes.includes(s));
   return {
     kind: 'ok',
     label: String(r.label),

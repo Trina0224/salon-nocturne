@@ -9,6 +9,7 @@ import type { Limiters } from './api/app.ts';
 import type { AppConfig } from './config.ts';
 import { Ledger, type LedgerHooks } from './store/ledger.ts';
 import { ReadModel } from './store/reads.ts';
+import { AdminRelay } from './store/relay.ts';
 import { Authenticator } from './store/auth.ts';
 import { createApp, type AppEnv } from './api/app.ts';
 
@@ -17,6 +18,7 @@ export interface Salon {
   auth: Authenticator;
   ledger: Ledger;
   reads: ReadModel;
+  relay: AdminRelay | null;
   app: Hono<AppEnv>;
 }
 
@@ -36,6 +38,11 @@ export function createSalon(opts: SalonOptions): Salon {
   const cursors = new CursorCodec(`cursor:${opts.config.tokenPepper}`);
   const ledger = new Ledger(opts.db, opts.clock, auth, { writesPerMinute: opts.config.writesPerMinute }, opts.hooks);
   const reads = new ReadModel(opts.db, opts.clock, cursors, { exportByteCap: opts.config.exportByteCap });
-  const app = createApp({ db: opts.db, auth, ledger, reads, limiters: opts.limiters, maintenance: opts.config.maintenance, mcp: opts.config.mcp, log: opts.log });
-  return { db: opts.db, auth, ledger, reads, app };
+  // The administration relay exists only with MCP/OAuth configured: relays
+  // are OAuth bindings, and approvals are bound to the MCP resource as their
+  // service context.
+  const mcp = opts.config.mcp;
+  const relay = mcp ? new AdminRelay({ db: opts.db, clock: opts.clock, auth, ledger, issuer: mcp.issuer, context: mcp.resource }) : null;
+  const app = createApp({ db: opts.db, auth, ledger, reads, relay, limiters: opts.limiters, maintenance: opts.config.maintenance, mcp, log: opts.log });
+  return { db: opts.db, auth, ledger, reads, relay, app };
 }

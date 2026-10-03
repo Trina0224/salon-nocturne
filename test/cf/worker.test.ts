@@ -241,6 +241,24 @@ test('Worker: MCP over OAuth in workerd: discovery, a bound agent posts, an unbo
     assert.equal((await api(worker, 'POST', '/api/v1/admin/oauth-bindings', OWNER_TOKEN,
       { participant_id: 'p_host', subject: 'synthetic-\u{1F3B7}', label: 'emoji', confirm_owner: true })).status, 201);
     assert.equal((await rpc(await mint('synthetic-\u{1F3B7}'), 'tools/list')).status, 200);
+    // Administration relay on D1: propose over MCP, approve with the owner token, execute once.
+    assert.equal((await api(worker, 'POST', '/api/v1/admin/oauth-bindings', OWNER_TOKEN,
+      { participant_id: agent.data.participant.id, subject: 'synthetic-rei-relay', label: 'relay', purpose: 'relay' })).status, 201);
+    const relayToken = await issuer.mint({ iss: issuer.issuer, sub: 'synthetic-rei-relay', aud: resource, scope: 'salon:relay' });
+    const enroll = { operation: 'enroll_participant', participant_name: 'Synthetic Muse', subject: 'synthetic-muse', label: 'synthetic' };
+    const proposed = await rpc(relayToken, 'tools/call', { name: 'propose_admin_operation', arguments: enroll });
+    const op = proposed.body.result.structuredContent.operation;
+    assert.equal(op.state, 'proposed', JSON.stringify(proposed.body));
+    const approved = await api(worker, 'POST', `/api/v1/admin/operations/${op.id}/approve`, OWNER_TOKEN, { digest: op.digest, ttl_minutes: 5 });
+    assert.equal(approved.data.operation.state, 'approved');
+    assert.equal(Date.parse(approved.data.operation.approval_expires_at) - Date.parse(approved.data.operation.decided_at), 5 * 60_000);
+    const exec = (key: string) => rpc(relayToken, 'tools/call', { name: 'execute_admin_operation', arguments: { operation_id: op.id, ...enroll, idempotency_key: key } });
+    const done = await exec('wk-relay-0001');
+    assert.equal(done.body.result.structuredContent.replayed, false, JSON.stringify(done.body));
+    assert.equal(done.body.result.structuredContent.operation.state, 'executed');
+    assert.equal((await exec('wk-relay-0001')).body.result.structuredContent.replayed, true);
+    assert.equal((await exec('wk-relay-0002')).body.result.structuredContent.error.code, 'APPROVAL_USED');
+    assert.equal((await rpc(await mint('synthetic-muse'), 'tools/list')).status, 200);
     // Origin policy.
     const fromOrigin = (origin: string) => worker.fetch(resource, { method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${t}`, Origin: origin }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'ping' }) });

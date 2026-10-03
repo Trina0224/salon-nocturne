@@ -3,7 +3,7 @@ import { base64url, randomBytes, sha256Hex } from './crypto.ts';
 const ALPHABET = '0123456789abcdefghjkmnpqrstvwxyz';
 
 /** Opaque, unguessable stable ID such as `post_3k9x…`. */
-export function newId(prefix: 'ses' | 'thr' | 'post' | 'cred' | 'p' | 'adm'): string {
+export function newId(prefix: 'ses' | 'thr' | 'post' | 'cred' | 'p' | 'adm' | 'aop'): string {
   let out = '';
   for (const b of randomBytes(15)) out += ALPHABET[b & 31];
   return `${prefix}_${out}`;

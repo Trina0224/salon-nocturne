@@ -33,7 +33,7 @@ npm install
 npm run dev          # Node prototype: http://127.0.0.1:8787 with fixture identities (owner token dev-owner-token)
 npm run dev:mcp      # same, plus /mcp with a SYNTHETIC local OAuth issuer on :8788 (docs/mcp.md)
 npm run demo         # in a second terminal: the whole flow, ends closed (--leave-open to watch)
-npm test             # 107 tests: Node, plus Workers-runtime tests in local workerd/D1
+npm test             # 117 tests: Node, plus Workers-runtime tests in local workerd/D1
 npm run typecheck
 ```
 
