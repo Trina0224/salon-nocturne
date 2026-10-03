@@ -30,7 +30,7 @@ export interface CallOptions {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type Json = any;
 
-export function setup(opts: { dbPath?: string; writesPerMinute?: number; readsPerMinute?: number; requestsPerMinute?: number; exportByteCap?: number; maintenance?: boolean; mcp?: McpConfig | null } = {}) {
+export function setup(opts: { dbPath?: string; writesPerMinute?: number; readsPerMinute?: number; requestsPerMinute?: number; exportByteCap?: number; maintenance?: boolean; mcp?: McpConfig | null; drive?: Parameters<typeof createLocalSalonSync>[0]['drive'] } = {}) {
   const clock = new FakeClock(T0);
   const hooks: LedgerHooks = {};
   // Rate limits are effectively off here; dedicated tests set small ones.
@@ -38,7 +38,7 @@ export function setup(opts: { dbPath?: string; writesPerMinute?: number; readsPe
     dbPath: opts.dbPath ?? ':memory:', clock, hooks,
     writesPerMinute: opts.writesPerMinute ?? 1_000_000, readsPerMinute: opts.readsPerMinute ?? 1_000_000,
     requestsPerMinute: opts.requestsPerMinute ?? 1_000_000,
-    exportByteCap: opts.exportByteCap, maintenance: opts.maintenance, mcp: opts.mcp,
+    exportByteCap: opts.exportByteCap, maintenance: opts.maintenance, mcp: opts.mcp, drive: opts.drive,
   });
   const raw = salon.sql.raw;
 

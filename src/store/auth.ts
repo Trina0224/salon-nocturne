@@ -9,6 +9,8 @@ import type { Actor, Role, Scope } from '../domain/model.ts';
 
 export const OWNER_PARTICIPANT_ID = 'p_host';
 export const OWNER_CREDENTIAL_ID = 'owner-secret';
+/** Credential IDs of Drive bridge actors; stored credentials are always 'cred_…'. */
+export const DRIVE_CREDENTIAL_PREFIX = 'drive:';
 export const AGENT_SCOPES: Scope[] = ['read', 'post'];
 
 export interface AuthConfig {
@@ -135,6 +137,15 @@ export async function resolveOAuthBinding(
  */
 export function accessStillValidSql(actor: Actor): { sql: string; params: string[] } {
   if (actor.role === 'owner' && actor.credentialId === OWNER_CREDENTIAL_ID) return { sql: '1', params: [] };
+  // Drive bridge actors hold no credential: access is the participant's
+  // enabled outbox mapping plus an active agent participant.
+  if (actor.credentialId.startsWith(DRIVE_CREDENTIAL_PREFIX)) {
+    return {
+      sql: `EXISTS (SELECT 1 FROM drive_participants d JOIN participants p ON p.id = d.participant_id
+              WHERE d.participant_id = ? AND d.enabled = 1 AND p.status = 'active' AND p.role = 'agent')`,
+      params: [actor.participantId],
+    };
+  }
   return {
     sql: `EXISTS (SELECT 1 FROM credentials c JOIN participants p ON p.id = c.participant_id
             WHERE c.id = ? AND p.id = ? AND c.revoked_at IS NULL AND p.status = 'active')`,

@@ -13,7 +13,7 @@ import { getPlatformProxy, unstable_dev } from 'wrangler';
 import { D1Sql, type D1Database } from '../../src/infra/d1.ts';
 import type { Clock } from '../../src/infra/clock.ts';
 import { MemoryReadLimiter } from '../../src/infra/ratelimit.ts';
-import { createSalon } from '../../src/context.ts';
+import { createSalon, type SalonOptions } from '../../src/context.ts';
 import type { LedgerHooks } from '../../src/store/ledger.ts';
 
 export const ROOT = fileURLToPath(new URL('../../', import.meta.url));
@@ -43,7 +43,7 @@ export function migratedState(): string {
 }
 
 /** The app wired to local D1 (inside workerd) through the platform proxy. */
-export async function d1Salon(opts: { clock: Clock; hooks?: LedgerHooks; writesPerMinute?: number }) {
+export async function d1Salon(opts: { clock: Clock; hooks?: LedgerHooks; writesPerMinute?: number; drive?: SalonOptions['drive'] }) {
   const dir = migratedState();
   const proxy = await getPlatformProxy<{ DB: D1Database }>({ configPath: CONFIG, persist: { path: join(dir, 'v3') }, envFiles: [] });
   const db = new D1Sql(proxy.env.DB);
@@ -53,6 +53,7 @@ export async function d1Salon(opts: { clock: Clock; hooks?: LedgerHooks; writesP
     config: { ownerTokenHashes: [OWNER_HASH], tokenPepper: PEPPER, writesPerMinute: opts.writesPerMinute ?? 1_000_000, exportByteCap: 2 * 1024 * 1024, maintenance: false, mcp: null },
     limiters: { requests: new MemoryReadLimiter(1_000_000, 60_000, opts.clock), participants: new MemoryReadLimiter(1_000_000, 60_000, opts.clock) },
     hooks: opts.hooks,
+    drive: opts.drive,
   });
   return {
     ...salon,

@@ -12,6 +12,7 @@ import type { SqlDb } from '../infra/sql.ts';
 import type { McpConfig } from '../config.ts';
 import { mcpRoutes } from '../mcp/server.ts';
 import type { AdminRelay } from '../store/relay.ts';
+import type { DriveBridge } from '../drive/bridge.ts';
 
 export interface Limiters {
   /** Per client address, every request, before credential lookup. */
@@ -27,6 +28,10 @@ export interface AppDeps {
   auth: Authenticator;
   /** Owner-approved administration relay; null when MCP/OAuth is not configured. */
   relay?: AdminRelay | null;
+  /** Drive message bridge; null when not configured. */
+  drive?: DriveBridge | null;
+  /** Called after a valid Drive notification, e.g. to schedule a bridge run. */
+  onDriveWake?: () => void;
   ledger: Ledger;
   reads: ReadModel;
   limiters: Limiters;
@@ -254,6 +259,22 @@ export function createApp(deps: AppDeps): Hono<AppEnv> {
     c.json({ schema_version: 1, operation: await relay().reject(requireOwner(c), c.req.param('id'), await readJson(c)) }));
   api.post('/admin/operations/:id/revoke', async (c) =>
     c.json({ schema_version: 1, operation: await relay().revoke(requireOwner(c), c.req.param('id')) }));
+  // Drive bridge: owner-visible state and recovery. No folder IDs or message bodies.
+  const drive = () => {
+    if (!deps.drive) throw new ApiError(409, 'NOT_FOUND', 'The Drive bridge is not configured.');
+    return deps.drive;
+  };
+  api.get('/admin/drive', async (c) => {
+    requireOwner(c);
+    return c.json({ schema_version: 1, ...(await drive().status()) });
+  });
+  api.post('/admin/drive/requeue', async (c) => {
+    requireOwner(c);
+    const body = await readJson(c);
+    if (body.kind !== 'files' && body.kind !== 'deliveries' && body.kind !== 'account') throw invalid('kind must be "files", "deliveries", or "account".');
+    if (body.id !== undefined && typeof body.id !== 'string') throw invalid('id must be a string.');
+    return c.json({ schema_version: 1, requeued: await drive().requeue(body.kind, body.id as string | undefined) });
+  });
 
   api.post('/admin/credentials/:id/revoke', async (c) => {
     const r = await ledger.revokeCredential(requireActor(c), c.req.param('id'));
@@ -261,6 +282,20 @@ export function createApp(deps: AppDeps): Hono<AppEnv> {
   });
 
   app.route('/api/v1', api);
+
+  // Drive push notifications only wake the bridge. Validation uses headers
+  // alone; the body is never read or trusted.
+  app.post('/drive/notifications', async (c) => {
+    if (!deps.drive) return c.body(null, 404);
+    const r = await deps.drive.notification({
+      channelId: c.req.header('x-goog-channel-id'),
+      token: c.req.header('x-goog-channel-token'),
+      resourceId: c.req.header('x-goog-resource-id'),
+      resourceState: c.req.header('x-goog-resource-state'),
+    });
+    if (r.woke) deps.onDriveWake?.();
+    return c.body(null, r.status);
+  });
   if (deps.mcp) app.route('/', mcpRoutes({ config: deps.mcp, db: deps.db, auth, ledger, reads, limiters, relay: deps.relay ?? null }));
   app.route('/', webRoutes(reads));
   app.notFound((c) =>

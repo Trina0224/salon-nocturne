@@ -10,6 +10,8 @@ import type { AppConfig } from './config.ts';
 import { Ledger, type LedgerHooks } from './store/ledger.ts';
 import { ReadModel } from './store/reads.ts';
 import { AdminRelay } from './store/relay.ts';
+import { DriveBridge, type BridgeHooks, type ClientFactory } from './drive/bridge.ts';
+import type { DriveBridgeConfig } from './drive/config.ts';
 import { Authenticator } from './store/auth.ts';
 import { createApp, type AppEnv } from './api/app.ts';
 
@@ -19,6 +21,8 @@ export interface Salon {
   ledger: Ledger;
   reads: ReadModel;
   relay: AdminRelay | null;
+  /** The Drive message bridge, when configured with a Drive client. */
+  drive: DriveBridge | null;
   app: Hono<AppEnv>;
 }
 
@@ -29,6 +33,8 @@ export interface SalonOptions {
   limiters: Limiters;
   hooks?: LedgerHooks;
   log?: (line: string) => void;
+  /** Drive bridge configuration and a Drive client per owner account (mocks locally). */
+  drive?: { config: DriveBridgeConfig; client: ClientFactory; hooks?: BridgeHooks };
 }
 
 export function createSalon(opts: SalonOptions): Salon {
@@ -43,6 +49,9 @@ export function createSalon(opts: SalonOptions): Salon {
   // service context.
   const mcp = opts.config.mcp;
   const relay = mcp ? new AdminRelay({ db: opts.db, clock: opts.clock, auth, ledger, issuer: mcp.issuer, context: mcp.resource }) : null;
-  const app = createApp({ db: opts.db, auth, ledger, reads, relay, limiters: opts.limiters, maintenance: opts.config.maintenance, mcp, log: opts.log });
-  return { db: opts.db, auth, ledger, reads, relay, app };
+  const drive = opts.drive
+    ? new DriveBridge({ db: opts.db, clock: opts.clock, ledger, config: opts.drive.config, client: opts.drive.client, secret: `drive:${opts.config.tokenPepper}`, hooks: opts.drive.hooks })
+    : null;
+  const app = createApp({ db: opts.db, auth, ledger, reads, relay, drive, limiters: opts.limiters, maintenance: opts.config.maintenance, mcp, log: opts.log });
+  return { db: opts.db, auth, ledger, reads, relay, drive, app };
 }

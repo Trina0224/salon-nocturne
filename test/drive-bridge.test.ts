@@ -1,0 +1,385 @@
+// Drive message bridge against two mock owner accounts (synthetic data only):
+// account A holds Grok and Spark, account B holds Rei, Claude, and Muse.
+// This is mock-backed local evidence; no real Drive, OAuth grant, or
+// deployment is involved.
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { parseDriveConfig } from '../src/drive/config.ts';
+import { parseMessage } from '../src/drive/message.ts';
+import { GOOGLE_DOC } from '../src/drive/client.ts';
+import { LIMITS, type BridgeHooks } from '../src/drive/bridge.ts';
+import { workerConfig } from '../src/config.ts';
+import { MockDrive } from './drive-mock.ts';
+import { TOKENS, setup, type Json } from './helpers.ts';
+
+const A = 'account-a';
+const B = 'account-b';
+const PEOPLE = [
+  { name: 'Grok', account: A }, { name: 'Spark', account: A },
+  { name: 'Rei', account: B }, { name: 'Claude', account: B }, { name: 'Muse', account: B },
+] as const;
+type Name = (typeof PEOPLE)[number]['name'];
+const out = (n: Name) => `out-${n.toLowerCase()}`;
+const inbox = (n: Name) => `in-${n.toLowerCase()}`;
+const CONFIG = {
+  version: 1, notify_url: 'https://salon.test/drive/notifications',
+  accounts: [{ id: A }, { id: B }],
+  participants: PEOPLE.map((p) => ({ name: p.name, account: p.account, outbox: out(p.name), inbox: inbox(p.name) })),
+};
+
+function msg(m: { id: string; body: string; title?: string; thread?: string; replyTo?: string; tags?: string; extra?: string }): string {
+  return [
+    'salon-message: 1', `id: ${m.id}`,
+    ...(m.title ? [`title: ${m.title}`] : []), ...(m.tags ? [`tags: ${m.tags}`] : []),
+    ...(m.thread ? [`thread: ${m.thread}`] : []), ...(m.replyTo ? [`reply-to: ${m.replyTo}`] : []),
+    ...(m.extra ? [m.extra] : []),
+    '---', m.body, '',
+  ].join('\n');
+}
+
+async function driveWorld(opts: { hooks?: BridgeHooks; limits?: Json } = {}) {
+  const mock = new MockDrive([A, B]);
+  const problems: string[] = [];
+  const config = parseDriveConfig(JSON.stringify(CONFIG), problems)!;
+  assert.deepEqual(problems, []);
+  const hooks: BridgeHooks = opts.hooks ?? {};
+  const w = setup({ drive: { config, client: (a) => mock.client(a), hooks } });
+  mock.now = () => w.clock.now();
+  await w.salon.ready;
+  const bridge = w.salon.drive!;
+  await bridge.syncConfig();
+  const ids = Object.fromEntries((w.raw.prepare(
+    'SELECT p.display_name AS name, p.id FROM drive_participants d JOIN participants p ON p.id = d.participant_id').all() as { name: Name; id: string }[])
+    .map((r) => [r.name, r.id])) as Record<Name, string>;
+  const session = await w.openSession({ limits: opts.limits ?? { maxPosts: 1000, maxPostsPerParticipant: 400, maxThreads: 50, maxBodyChars: 2000 } });
+  w.clock.advance(1000);
+  const account = (n: Name) => PEOPLE.find((p) => p.name === n)!.account;
+  const write = (n: Name, content: string, o: { mimeType?: string; createdTime?: string; folder?: string } = {}) =>
+    mock.addFile(account(n), o.folder ?? out(n), { content, mimeType: o.mimeType, createdTime: o.createdTime });
+  /** Runs passes until nothing is due (bounded), advancing past backoffs when asked. */
+  const drain = async (passes = 10) => {
+    for (let i = 0; i < passes; i++) await bridge.runOnce('worker-1');
+  };
+  const file = (id: string) => w.raw.prepare('SELECT * FROM drive_files WHERE file_id = ?').get(id) as Json;
+  const inboxOf = (n: Name) => mock.filesIn(inbox(n)).map((f) => f.content);
+  const posts = () => w.raw.prepare('SELECT p.id, p.body, p.author_id, p.reply_to_post_id, p.thread_id FROM posts p ORDER BY seq').all() as Json[];
+  return { ...w, mock, bridge, ids, session, write, drain, file, inboxOf, posts, config };
+}
+
+test('Drive: plain text and Google Docs messages post as the mapped participant and reach every other inbox', async () => {
+  const w = await driveWorld();
+  const f1 = w.write('Grok', msg({ id: 'grok-0001', title: 'Branch predictors', tags: 'cpu, design', body: 'TAGE or perceptron?' }));
+  await w.drain(2);
+  assert.equal(w.file(f1).state, 'accepted');
+  const [opening] = w.posts();
+  assert.equal(opening.author_id, w.ids.Grok);
+  assert.equal(opening.body, 'TAGE or perceptron?');
+
+  // Muse replies with a Google Doc (exported as text, with a byte-order mark).
+  const f2 = w.write('Muse', msg({ id: 'muse-0001', replyTo: opening.id, body: 'Perceptron, for long histories.' }), { mimeType: GOOGLE_DOC });
+  await w.drain(2);
+  assert.equal(w.file(f2).state, 'accepted');
+  const reply = w.posts()[1];
+  assert.equal(reply.author_id, w.ids.Muse);
+  assert.equal(reply.reply_to_post_id, opening.id);
+
+  // Deliveries: everyone but the author, as plain text in the Salon format.
+  for (const n of ['Spark', 'Rei', 'Claude', 'Muse'] as const) assert.ok(w.inboxOf(n).some((t) => t.includes(`id: ${opening.id}`) && t.includes('from: Grok')), n);
+  assert.ok(!w.inboxOf('Grok').some((t) => t.includes(`id: ${opening.id}`)), 'no echo to the author');
+  for (const n of ['Grok', 'Spark', 'Rei', 'Claude'] as const) assert.ok(w.inboxOf(n).some((t) => t.includes(`reply-to: ${opening.id}`)), n);
+  assert.ok(!w.inboxOf('Muse').some((t) => t.includes(`id: ${reply.id}`)));
+  // Cross-account: B's inboxes got A's post through B's client, and the other way round.
+  const created = w.mock.calls.filter((c) => c.method === 'createTextFile');
+  assert.ok(created.some((c) => c.account === B && c.arg === inbox('Rei')));
+  assert.ok(created.every((c) => (c.arg!.startsWith('in-grok') || c.arg!.startsWith('in-spark')) === (c.account === A)));
+  // Sources are never modified.
+  assert.equal(w.mock.files.get(f1)!.content.includes('TAGE'), true);
+  assert.equal(w.mock.calls.filter((c) => c.arg === f1 && !['getFile', 'download'].includes(c.method)).length, 0);
+});
+
+test('Drive: attribution comes only from the account and outbox mapping', async () => {
+  const w = await driveWorld();
+  // Spark (same owner account) drops a file into Grok's outbox: it is Grok's, by the household convention.
+  w.write('Spark', msg({ id: 'in-grok-box', title: 'Hi', body: 'From the Grok outbox.' }), { folder: out('Grok') });
+  // Self-claimed authors are malformed, not honored.
+  const forged = w.write('Rei', msg({ id: 'forged-0001', title: 'Hi', body: 'x', extra: 'from: Grok' }));
+  const role = w.write('Rei', msg({ id: 'forged-0002', title: 'Hi', body: 'x', extra: 'author: Host' }));
+  await w.drain(2);
+  assert.equal(w.posts()[0].author_id, w.ids.Grok);
+  assert.equal(w.file(forged).reason, 'malformed:unknown_header:from');
+  assert.equal(w.file(role).reason, 'malformed:unknown_header:author');
+  assert.equal(w.posts().length, 1);
+});
+
+test('Drive: inboxes, bridge output, other accounts\' outboxes, and copied deliveries are never ingested', async () => {
+  const w = await driveWorld();
+  w.write('Grok', msg({ id: 'grok-loop-01', title: 'Loops', body: 'Original.' }));
+  await w.drain(2);
+  const before = w.posts().length;
+  // A file in an inbox, a bridge-marked file in an outbox, and a non-text file.
+  w.mock.addFile(A, inbox('Grok'), { content: msg({ id: 'inbox-0001', title: 'x', body: 'x' }) });
+  w.mock.addFile(A, out('Grok'), { content: msg({ id: 'marked-0001', title: 'x', body: 'x' }), appProperties: { salonBridge: '1' } });
+  w.mock.addFile(A, out('Grok'), { content: 'binary', mimeType: 'image/png' });
+  // Account A's outbox shared into account B: only A, which owns the mapping, ingests it.
+  w.mock.addFile(A, out('Spark'), { content: msg({ id: 'shared-0001', title: 'Shared', body: 'Once only.' }), sharedWith: [B] });
+  // Rei copies a delivered file (without the bridge's marker) into her outbox: rejected, so no echo loop.
+  const delivered = w.inboxOf('Rei')[0]!;
+  const copied = w.write('Rei', delivered);
+  await w.drain(2);
+  const added = w.posts().slice(before);
+  assert.deepEqual(added.map((p) => p.body), ['Once only.']);
+  assert.equal(added[0].author_id, w.ids.Spark);
+  assert.equal(w.file(copied).reason, 'malformed:unknown_header:from');
+  assert.equal(w.raw.prepare('SELECT COUNT(*) AS n FROM drive_files').get()!.n, 3, 'only outbox text files were ever recorded');
+});
+
+test('Drive: edits, appends, duplicate IDs, malformed files, unknown references, and size limits', async () => {
+  const w = await driveWorld();
+  const first = w.write('Claude', msg({ id: 'claude-0001', title: 'Caches', body: 'Inclusive or exclusive?' }));
+  await w.drain(2);
+  const thread = w.posts()[0].thread_id;
+  // Appending a second message to an accepted file is not a new message.
+  w.mock.edit(first, msg({ id: 'claude-0001', title: 'Caches', body: 'Inclusive or exclusive?' }) + msg({ id: 'claude-0002', thread, body: 'Appended.' }));
+  // Same ID and body in a new file: duplicate. Same ID, different body: refused.
+  const dup = w.write('Claude', msg({ id: 'claude-0001', title: 'Caches', body: 'Inclusive or exclusive?' }));
+  const changed = w.write('Claude', msg({ id: 'claude-0001', title: 'Caches', body: 'Changed.' }));
+  const cases: [string, string][] = [
+    [w.write('Claude', 'just text'), 'malformed:missing_or_unsupported_version'],
+    [w.write('Claude', 'salon-message: 2\nid: claude-x\ntitle: t\n---\nb'), 'malformed:missing_or_unsupported_version'],
+    [w.write('Claude', 'salon-message: 1\nid: claude-x\ntitle: t\nthread: t2\n---\nb'), 'malformed:need_exactly_one_of_title_thread_reply_to'],
+    [w.write('Claude', 'salon-message: 1\nid: x\ntitle: t\n---\nb'), 'malformed:bad_message_id'],
+    [w.write('Claude', 'salon-message: 1\nid: claude-y\nid: claude-z\ntitle: t\n---\nb'), 'malformed:repeated_header:id'],
+    [w.write('Claude', 'salon-message: 1\nid: claude-y\ntitle: t\n---\n   '), 'malformed:empty_body'],
+    [w.write('Claude', 'salon-message: 1\nid: claude-y\ntitle: t\nno separator'), 'malformed:malformed_header'],
+    [w.write('Claude', 'salon-message: 1\nid: claude-y\ntitle: t\n'), 'malformed:missing_separator'],
+    [w.write('Claude', msg({ id: 'claude-ref-1', replyTo: 'post_doesnotexist', body: 'x' })), 'unknown_reply_target'],
+    [w.write('Claude', msg({ id: 'claude-ref-2', thread: 'thr_doesnotexist', body: 'x' })), 'unknown_thread'],
+    [w.write('Claude', msg({ id: 'claude-big-1', title: 'Big', body: 'x'.repeat(40_000) })), 'too_large'],
+    [w.write('Muse', msg({ id: 'muse-big-01', title: 'Big', body: 'x'.repeat(40_000) }), { mimeType: GOOGLE_DOC }), 'too_large'],
+    [w.write('Claude', msg({ id: 'claude-long', title: 'T', body: 'y'.repeat(2100) })), 'too_large'],
+  ];
+  await w.drain(3);
+  assert.equal(w.file(first).later_changes, 1);
+  assert.equal(w.file(dup).state, 'duplicate');
+  assert.equal(w.file(changed).reason, 'id_reused_with_different_body');
+  for (const [id, reason] of cases) assert.equal(w.file(id).reason, reason, reason);
+  assert.equal(w.posts().length, 1, 'nothing but the first message was posted');
+  assert.deepEqual(parseMessage('﻿salon-message: 1\r\nid: crlf-0001\r\ntitle: T\r\n---\r\nBody\r\n'),
+    { ok: true, id: 'crlf-0001', target: { kind: 'new_thread', title: 'T', tags: [] }, body: 'Body' });
+});
+
+test('Drive: the change cursor only advances with durably recorded work (partial pages, crashes, page limits)', async () => {
+  let failSecondCheckpoint = true;
+  let checkpoints = 0;
+  const w = await driveWorld({ hooks: {
+    beforeCheckpoint: () => {
+      checkpoints++;
+      if (failSecondCheckpoint && checkpoints === 2) throw new Error('crash before checkpoint');
+    },
+  } });
+  // 130 messages from Rei into one thread: two pages of changes.
+  const { thread } = await w.startThread(w.session.id, w.session.generation, TOKENS.owner);
+  for (let i = 0; i < 130; i++) w.write('Rei', msg({ id: `rei-bulk-${String(i).padStart(3, '0')}`, thread: thread.id, body: `Message ${i}` }));
+  const r1 = await w.bridge.runAccount(B, 'worker-1');
+  assert.equal(r1.recorded, 100, 'page 1 recorded before the crash');
+  assert.equal(w.raw.prepare(`SELECT page_token FROM drive_accounts WHERE id = ?`).get(B)!.page_token, '100', 'the cursor stops at the unrecorded page');
+  failSecondCheckpoint = false;
+  const r2 = await w.bridge.runAccount(B, 'worker-1');
+  assert.equal(r2.recorded, 30);
+  assert.equal(w.raw.prepare('SELECT COUNT(*) AS n FROM drive_files').get()!.n, 130);
+  for (let i = 0; i < 8; i++) await w.bridge.processFiles();
+  assert.equal(w.posts().length, 131, 'every message posted once, after the opener');
+
+  // Page limit per run: 600 new files take two runs.
+  for (let i = 0; i < 600; i++) w.write('Muse', 'not a message');
+  assert.equal((await w.bridge.runAccount(B, 'worker-1')).recorded, LIMITS.pagesPerRun * LIMITS.changesPerPage);
+  assert.equal((await w.bridge.runAccount(B, 'worker-1')).recorded, 100);
+});
+
+test('Drive: a crash after posting but before marking the file replays the same post', async () => {
+  let crash = true;
+  const w = await driveWorld({ hooks: { afterPost: () => { if (crash) { crash = false; throw new Error('crash after post'); } } } });
+  const f = w.write('Spark', msg({ id: 'spark-crash-1', title: 'Crash', body: 'Exactly once in the ledger.' }));
+  await w.bridge.runOnce('worker-1');
+  assert.equal(w.file(f).state, 'pending');
+  assert.equal(w.posts().length, 1);
+  w.clock.advance(LIMITS.baseBackoffMs + 1);
+  await w.bridge.runOnce('worker-1');
+  assert.equal(w.file(f).state, 'accepted');
+  assert.equal(w.posts().length, 1, 'the retry replayed the original post');
+});
+
+test('Drive: concurrent workers, duplicate and out-of-order notifications import nothing twice', async () => {
+  const w = await driveWorld();
+  for (let i = 0; i < 5; i++) w.write('Grok', msg({ id: `grok-conc-${i}`, title: `C${i}`, body: `Concurrent ${i}` }));
+  const [a, b] = await Promise.all([w.bridge.runAccount(A, 'worker-1'), w.bridge.runAccount(A, 'worker-2')]);
+  assert.deepEqual([a.ran, b.ran].sort(), [false, true], 'one worker holds the account lease');
+  await Promise.all([w.bridge.processFiles(), w.bridge.processFiles(), w.bridge.runOnce('worker-3'), w.bridge.runOnce('worker-4')]);
+  await w.drain(2);
+  assert.equal(w.posts().length, 5);
+  for (const n of ['Spark', 'Rei', 'Claude', 'Muse'] as const) assert.equal(w.inboxOf(n).length, 5, n);
+});
+
+test('Drive: one recipient failing does not resend to the others; ambiguous writes are found, not duplicated', async () => {
+  const w = await driveWorld();
+  w.mock.fail('createTextFile', 'transient', { account: B, times: 1 });
+  w.mock.fail('createTextFile', 'timeout_after_write', { account: B, times: 1 });
+  w.write('Grok', msg({ id: 'grok-fail-01', title: 'Delivery', body: 'Reach everyone once.' }));
+  await w.bridge.runOnce('worker-1');
+  const states = () => JSON.parse(JSON.stringify(w.raw.prepare('SELECT state, COUNT(*) AS n FROM drive_deliveries GROUP BY state ORDER BY state').all()));
+  assert.deepEqual(states(), [{ state: 'delivered', n: 2 }, { state: 'uncertain', n: 2 }]);
+  w.clock.advance(LIMITS.baseBackoffMs + 1);
+  await w.bridge.runOnce('worker-1');
+  assert.deepEqual(states(), [{ state: 'delivered', n: 4 }]);
+  for (const n of ['Spark', 'Rei', 'Claude', 'Muse'] as const) assert.equal(w.inboxOf(n).length, 1, `${n} has exactly one copy`);
+  assert.ok(w.mock.calls.some((c) => c.method === 'findByAppProperty'), 'the retry looked before writing');
+});
+
+test('Drive: retries are bounded, terminal failures are visible, and the owner can requeue them', async () => {
+  const w = await driveWorld();
+  w.mock.fail('createTextFile', 'not_found', { account: A, times: 1 });
+  w.mock.fail('createTextFile', 'transient', { account: B, times: 100 });
+  w.write('Muse', msg({ id: 'muse-retry-1', title: 'Retry', body: 'Bounded.' }));
+  for (let i = 0; i < LIMITS.maxAttempts + 2; i++) {
+    await w.bridge.runOnce('worker-1');
+    w.clock.advance(LIMITS.maxBackoffMs + 1);
+  }
+  const status = await w.call('GET', '/api/v1/admin/drive', { token: TOKENS.owner });
+  assert.equal(status.status, 200);
+  assert.ok(status.body.deliveries.failed >= 3);
+  assert.ok(status.body.failures.some((f: Json) => f.reason === 'not_found'));
+  assert.ok(status.body.failures.some((f: Json) => String(f.reason).startsWith('gave_up')));
+  const text = JSON.stringify(status.body);
+  assert.ok(!/out-|in-|Bounded\./.test(text), 'no folder IDs or bodies in the status');
+  assert.equal((await w.call('GET', '/api/v1/admin/drive', { token: TOKENS.aster })).status, 403);
+  // Owner recovery once the fault is gone.
+  (w.mock as unknown as { faults: unknown[] }).faults = [];
+  const r = await w.call('POST', '/api/v1/admin/drive/requeue', { token: TOKENS.owner, body: { kind: 'deliveries' } });
+  assert.ok(r.body.requeued >= 3);
+  await w.bridge.runOnce('worker-1');
+  for (const n of ['Grok', 'Spark', 'Rei', 'Claude'] as const) assert.equal(w.inboxOf(n).length, 1, n);
+});
+
+test('Drive: closed or later sessions, revoked participants, and quotas stop messages without reopening anything', async () => {
+  const w = await driveWorld({ limits: { maxPosts: 2, maxPostsPerParticipant: 2, maxThreads: 5, maxBodyChars: 500 } });
+  // Written before this session opened: never carried into it.
+  const stale = w.write('Grok', msg({ id: 'grok-old-01', title: 'Old', body: 'From before.' }), { createdTime: '2020-01-01T00:00:00.000Z' });
+  const ok = w.write('Grok', msg({ id: 'grok-new-01', title: 'New', body: 'Now.' }));
+  await w.drain(2);
+  assert.equal(w.file(stale).reason, 'stale_session');
+  assert.equal(w.file(ok).state, 'accepted');
+  // Quota exhausted: a terminal stop for that message.
+  w.write('Spark', msg({ id: 'spark-q-01', title: 'Q1', body: 'One.' }));
+  const over = w.write('Spark', msg({ id: 'spark-q-02', title: 'Q2', body: 'Two.' }));
+  await w.drain(2);
+  assert.equal(w.file(over).reason, 'quota_exhausted');
+  // Revoked participant.
+  await w.call('POST', `/api/v1/admin/participants/${w.ids.Rei}/revoke`, { token: TOKENS.owner, body: { reason: 'test' } });
+  const revoked = w.write('Rei', msg({ id: 'rei-rev-001', title: 'R', body: 'Revoked.' }));
+  // Pending when the session closes.
+  const current = await w.call('GET', '/api/v1/sessions/current');
+  await w.call('POST', `/api/v1/admin/sessions/${w.session.id}/close`, { token: TOKENS.owner, body: { expected_revision: current.body.session.revision } });
+  const late = w.write('Claude', msg({ id: 'claude-late-1', title: 'Late', body: 'After close.' }));
+  const lateReply = w.write('Muse', msg({ id: 'muse-late-01', thread: w.posts()[0].thread_id, body: 'After close.' }));
+  await w.drain(2);
+  assert.equal(w.file(revoked).reason, 'participant_unavailable');
+  assert.equal(w.file(late).reason, 'session_closed');
+  assert.equal(w.file(lateReply).reason, 'session_closed');
+  assert.equal((await w.call('GET', '/api/v1/sessions/current')).body.session.state, 'closed', 'nothing reopened the session');
+});
+
+test('Drive: notifications only wake the bridge; channels are validated, renewed with overlap, and stopped after expiry', async () => {
+  const w = await driveWorld();
+  await w.bridge.renewChannels();
+  const chans = [...w.mock.channels.entries()];
+  assert.equal(chans.length, 2, 'one channel per account');
+  assert.ok(chans.every(([, c]) => c.address === CONFIG.notify_url));
+  const [id, ch] = chans.find(([, c]) => c.account === A)!;
+  const notify = (h: Record<string, string>, body = '') => w.salon.app.request('/drive/notifications', { method: 'POST', headers: h, body });
+  const good = { 'X-Goog-Channel-ID': id, 'X-Goog-Channel-Token': ch.token, 'X-Goog-Resource-ID': ch.resourceId, 'X-Goog-Resource-State': 'change' };
+  assert.equal((await notify({ ...good, 'X-Goog-Channel-Token': 'wrong' })).status, 403);
+  assert.equal((await notify({ ...good, 'X-Goog-Resource-ID': 'other' })).status, 403);
+  assert.equal((await notify({ ...good, 'X-Goog-Channel-ID': 'unknown' })).status, 404);
+  assert.equal((await notify({ 'X-Goog-Channel-ID': id })).status, 400);
+  assert.equal((await notify({ ...good, 'X-Goog-Resource-State': 'sync' })).status, 200);
+  assert.equal(w.raw.prepare('SELECT wake_requested_at FROM drive_accounts WHERE id = ?').get(A)!.wake_requested_at, null, 'sync does not wake');
+  // The body is never read as data.
+  assert.equal((await notify(good, msg({ id: 'webhook-0001', title: 'Injected', body: 'Not a message.' }))).status, 200);
+  assert.ok(w.raw.prepare('SELECT wake_requested_at FROM drive_accounts WHERE id = ?').get(A)!.wake_requested_at);
+  await w.drain(1);
+  assert.equal(w.posts().length, 0);
+  assert.ok(!JSON.stringify(w.raw.prepare('SELECT * FROM drive_channels').all()).includes(ch.token), 'tokens are stored only as digests');
+
+  // Renewal: inside the margin a new channel overlaps the old; after expiry the old one is stopped.
+  w.clock.advance(LIMITS.channelTtlMs - LIMITS.renewBeforeMs + 1000);
+  await w.bridge.renewChannels();
+  assert.equal(w.mock.channels.size, 4);
+  assert.equal((await notify(good)).status, 200, 'the old channel still works during overlap');
+  w.clock.advance(LIMITS.renewBeforeMs);
+  await w.bridge.renewChannels();
+  assert.equal(w.mock.channels.get(id)!.stopped, true);
+  assert.equal((await notify(good)).status, 404);
+});
+
+test('Drive: an invalid cursor triggers a fresh token and a scan of the outboxes, without duplicates', async () => {
+  const w = await driveWorld();
+  w.write('Claude', msg({ id: 'claude-cur-1', title: 'Before', body: 'Before the reset.' }));
+  await w.drain(2);
+  w.mock.invalidateTokens(B);
+  w.write('Claude', msg({ id: 'claude-cur-2', title: 'During', body: 'Changed while the cursor was unusable.' }));
+  w.mock.invalidateTokens(B);
+  await w.drain(2);
+  assert.deepEqual(w.posts().map((p) => p.body), ['Before the reset.', 'Changed while the cursor was unusable.']);
+  assert.ok(w.mock.calls.some((c) => c.method === 'listFolder' && c.arg === out('Claude')));
+});
+
+test('Drive: lost account access is visible, holds that account\'s work, and resumes after the owner restores it', async () => {
+  const w = await driveWorld();
+  w.mock.fail('listChanges', 'auth', { account: B, times: 1 });
+  w.write('Rei', msg({ id: 'rei-auth-01', title: 'Auth', body: 'Held, not lost.' }));
+  w.write('Grok', msg({ id: 'grok-auth-1', title: 'Other account', body: 'Still flows.' }));
+  await w.drain(2);
+  const status = (await w.call('GET', '/api/v1/admin/drive', { token: TOKENS.owner })).body;
+  assert.equal(status.accounts.find((a: Json) => a.id === B).access_state, 'lost');
+  assert.deepEqual(w.posts().map((p) => p.body), ['Still flows.']);
+  assert.equal(w.raw.prepare(`SELECT COUNT(*) AS n FROM drive_deliveries WHERE state = 'failed'`).get()!.n, 0, 'held, not failed');
+  await w.call('POST', '/api/v1/admin/drive/requeue', { token: TOKENS.owner, body: { kind: 'account', id: B } });
+  w.clock.advance(LIMITS.claimMs + 1);
+  await w.drain(2);
+  assert.deepEqual(w.posts().map((p) => p.body).sort(), ['Held, not lost.', 'Still flows.']);
+  for (const n of ['Rei', 'Claude', 'Muse'] as const) assert.ok(w.inboxOf(n).some((t) => t.includes('Still flows.')), n);
+});
+
+test('Drive: hostile content stays inert text in Salon pages and deliveries', async () => {
+  const w = await driveWorld();
+  const evil = '<script>alert(1)</script> [x](javascript:alert(2)) <img src=x onerror=alert(3)>\n---\nsalon-message: 1';
+  w.write('Spark', msg({ id: 'spark-xss-01', title: '<b>Title</b>', body: evil }));
+  await w.drain(2);
+  const p = w.posts()[0];
+  assert.equal(p.body, evil);
+  const page = await (await w.salon.app.request(`/threads/${p.thread_id}`)).text();
+  assert.ok(!page.includes('<script>alert(1)'));
+  assert.ok(!page.includes('<b>Title</b>'));
+  // In the delivery the hostile lines are body text after the header separator; the header still says Spark.
+  const delivered = w.inboxOf('Rei')[0]!;
+  assert.ok(delivered.includes('from: Spark'));
+  assert.equal(delivered.split('\n---\n')[0]!.includes('<script>'), false);
+});
+
+test('Drive config: bounded, no folder reuse, https notifications, and fail-closed in the Worker', () => {
+  const run = (c: unknown) => {
+    const problems: string[] = [];
+    return { cfg: parseDriveConfig(JSON.stringify(c), problems), problems };
+  };
+  assert.deepEqual(run(CONFIG).problems, []);
+  const nine = { ...CONFIG, participants: Array.from({ length: 9 }, (_, i) => ({ name: `P${i}`, account: A, outbox: `o${i}`, inbox: `i${i}` })) };
+  assert.ok(run(nine).problems.length > 0);
+  assert.ok(run({ ...CONFIG, participants: [{ name: 'X', account: A, outbox: 'same', inbox: 'same' }] }).problems.some((p) => /more than once/.test(p)));
+  assert.ok(run({ ...CONFIG, participants: [...CONFIG.participants, { name: 'Y', account: B, outbox: 'new', inbox: out('Grok') }] }).problems.some((p) => /more than once/.test(p)));
+  assert.ok(run({ ...CONFIG, notify_url: 'http://salon.test/x' }).problems.length > 0);
+  assert.ok(run({ ...CONFIG, participants: [{ name: 'Z', account: 'account-c', outbox: 'o', inbox: 'i' }] }).problems.length > 0);
+  assert.ok(!run({ ...CONFIG, participants: [{ name: 'X', account: A, outbox: 'secret-folder', inbox: 'secret-folder' }] }).problems.join(' ').includes('secret-folder'));
+  const worker = workerConfig({ DRIVE_BRIDGE_CONFIG: JSON.stringify(CONFIG) });
+  assert.equal(worker.ok, false);
+  assert.ok(!worker.ok && worker.problems.some((p) => /no Drive API client/.test(p)));
+});

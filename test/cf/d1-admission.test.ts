@@ -55,7 +55,7 @@ test('D1: migrations apply with the Wrangler CLI and are idempotent', async () =
     for (const table of ['sessions', 'posts', 'changes', 'write_receipts', 'admissions', 'credentials', 'post_search']) {
       assert.equal(await count(`SELECT COUNT(*) AS n FROM sqlite_master WHERE name = ?`, table), 1, table);
     }
-    assert.equal(await count('SELECT COUNT(*) AS n FROM d1_migrations'), 4);
+    assert.equal(await count('SELECT COUNT(*) AS n FROM d1_migrations'), 5);
     assert.equal(await count(`SELECT COUNT(*) AS n FROM pragma_table_info('credentials') WHERE name = 'kind'`), 1, 'migration 0003');
     assert.equal(await count('SELECT COUNT(*) AS n FROM admissions'), 0, 'guard rows never persist');
   } finally {
