@@ -46,9 +46,14 @@ export const LIMITS = {
   maxBackoffMs: 60 * 60_000,
   /** How long a worker may hold an account, file, or delivery before another may take over. */
   claimMs: 2 * 60_000,
-  /** Requested channel lifetime and renewal margin. The Drive maximum is unverified here. */
+  /**
+   * Requested channel lifetime and renewal margin. Drive allows changes
+   * watches at most one week; the expiration Drive returns is what is stored.
+   */
   channelTtlMs: 6 * 24 * 60 * 60_000,
   renewBeforeMs: 24 * 60 * 60_000,
+  /** Change-feed rounds one notification-started run may take. */
+  wakeRounds: 3,
 } as const;
 
 /** Ledger errors that end a file's processing for good. Anything else is retried. */
@@ -145,11 +150,25 @@ export class DriveBridge {
 
   /**
    * Validates a Drive push notification. Only headers matter; the body is
-   * never read. A valid notification marks the account for a run.
+   * never read. A valid change notification marks the account for a run and
+   * reports `woke` only when no run was already pending for it, so a burst of
+   * notifications starts at most one run per account (coalescing).
+   *
+   * - `sync` (sent when a watch starts, possibly before the watch call has
+   *   even returned and the channel is stored) is acknowledged and ignored,
+   *   before any lookup.
+   * - Drive's push guide spells the change state both "change" (its table)
+   *   and "changed" (its example), so both are accepted. Any other state is
+   *   acknowledged without waking anything; scheduled runs catch up.
+   * - Unknown, stopped, or expired channels, a wrong token, or a wrong
+   *   resource ID never start work.
    */
-  async notification(headers: { channelId?: string; token?: string; resourceId?: string; resourceState?: string }): Promise<{ status: 200 | 400 | 403 | 404; woke: boolean }> {
+  async notification(headers: { channelId?: string; token?: string; resourceId?: string; resourceState?: string }): Promise<{ status: 200 | 400 | 403 | 404; woke: boolean; accountId?: string }> {
     const { channelId, token, resourceId, resourceState } = headers;
     if (!channelId || !token || !resourceId || !resourceState) return { status: 400, woke: false };
+    // Our channel IDs and tokens are short; anything longer is not ours (bounds the HMAC work too).
+    if (channelId.length > 64 || token.length > 256 || resourceId.length > 256 || resourceState.length > 32) return { status: 400, woke: false };
+    if (resourceState === 'sync') return { status: 200, woke: false };
     const ch = await this.db.first(
       `SELECT c.*, a.access_state FROM drive_channels c JOIN drive_accounts a ON a.id = c.account_id
        WHERE c.id = ? AND c.state = 'active'`, channelId);
@@ -157,9 +176,11 @@ export class DriveBridge {
     const digest = await hmacHex(this.secret, `drive-channel-v1:${token}`);
     if (!timingSafeEqual(digest, String(ch.token_digest)) || ch.resource_id !== resourceId) return { status: 403, woke: false };
     if (Date.parse(String(ch.expires_at)) <= this.clock.now()) return { status: 404, woke: false };
-    if (resourceState === 'sync') return { status: 200, woke: false };
-    await this.db.run('UPDATE drive_accounts SET wake_requested_at = ? WHERE id = ?', this.now(), String(ch.account_id));
-    return { status: 200, woke: true };
+    if (resourceState !== 'change' && resourceState !== 'changed') return { status: 200, woke: false };
+    const accountId = String(ch.account_id);
+    const marked = await this.db.run(
+      `UPDATE drive_accounts SET wake_requested_at = ? WHERE id = ? AND wake_requested_at IS NULL AND access_state = 'ok'`, this.now(), accountId);
+    return { status: 200, woke: marked.changes === 1, accountId };
   }
 
   /**
@@ -209,6 +230,8 @@ export class DriveBridge {
        WHERE id = ? AND access_state = 'ok' AND (lease_until IS NULL OR lease_until <= ?)`,
       workerId, iso(nowMs + LIMITS.claimMs), accountId, iso(nowMs));
     if (leased.changes !== 1) return { ran: false, recorded: 0 };
+    // Taken now, so a notification arriving during this run re-arms the account for another run.
+    await this.db.run('UPDATE drive_accounts SET wake_requested_at = NULL WHERE id = ? AND lease_owner = ?', accountId, workerId);
     const client = this.client(accountId);
     let recorded = 0;
     try {
@@ -243,7 +266,7 @@ export class DriveBridge {
           if (!result.nextPageToken) break;
         }
       }
-      await this.db.run(`UPDATE drive_accounts SET wake_requested_at = NULL, last_run_at = ?, last_error = CASE WHEN recovery_token IS NULL THEN NULL ELSE 'cursor_reset' END WHERE id = ?`, this.now(), accountId);
+      await this.db.run(`UPDATE drive_accounts SET last_run_at = ?, last_error = CASE WHEN recovery_token IS NULL THEN NULL ELSE 'cursor_reset' END WHERE id = ?`, this.now(), accountId);
     } catch (err) {
       await this.accountError(accountId, err);
     } finally {
@@ -434,6 +457,8 @@ export class DriveBridge {
     } catch (err) {
       if (err instanceof ApiError && TERMINAL_CODES.has(err.code)) return this.finishFile(fileId, 'rejected', err.code.toLowerCase());
       if (err instanceof DriveError && err.kind === 'not_found') return this.finishFile(fileId, 'rejected', 'file_gone');
+      // Drive refused this file (not the account): a visible, terminal outcome rather than eight retries.
+      if (err instanceof DriveError && err.kind === 'permanent') return this.finishFile(fileId, 'rejected', `drive_${err.message}`);
       if (err instanceof DriveError && err.kind === 'auth') {
         await this.accountError(accountId, err);
         // The job stays pending and is retried once access is restored; this attempt is not counted.
@@ -759,6 +784,25 @@ export class DriveBridge {
   }
 
   // ---- whole run and owner controls -----------------------------------------------
+
+  /**
+   * The bounded run started by a valid change notification: this account's
+   * changes (again, up to `wakeRounds` times, if notifications arrived during
+   * the run), then due files, fan-out, and deliveries. Channel renewal and
+   * configuration sync are left to the scheduled run.
+   */
+  async runAfterWake(accountId: string, workerId = `w_${base64url(randomBytes(6))}`): Promise<void> {
+    if (!this.config.accounts.some((a) => a.id === accountId)) return;
+    for (let round = 0; round < LIMITS.wakeRounds; round++) {
+      const r = await this.runAccount(accountId, workerId);
+      if (!r.ran) break; // another worker holds the account; it will see the changes
+      const again = await this.db.first('SELECT wake_requested_at FROM drive_accounts WHERE id = ?', accountId);
+      if (!again?.wake_requested_at) break;
+    }
+    await this.processFiles();
+    await this.fanOut();
+    await this.deliver();
+  }
 
   /** One bounded pass: channels, every account with access, files, fan-out, deliveries. */
   async runOnce(workerId = `w_${base64url(randomBytes(6))}`): Promise<void> {

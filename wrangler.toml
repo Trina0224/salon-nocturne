@@ -45,3 +45,9 @@ simple = { limit = 120, period = 60 }
 SALON_MAINTENANCE = "off"
 WRITES_PER_MINUTE = "10"
 EXPORT_BYTE_CAP = "2097152"
+
+# Drive bridge catch-up runs (docs/drive-bridge.md). Deliberately NOT
+# enabled: activation is a separate owner decision, together with the Drive
+# secrets. When approved, uncomment (the interval is a proposal):
+# [triggers]
+# crons = ["*/10 * * * *"]

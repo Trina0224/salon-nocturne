@@ -305,7 +305,10 @@ test('Drive: notifications only wake the bridge; channels are validated, renewed
   assert.equal(w.raw.prepare('SELECT wake_requested_at FROM drive_accounts WHERE id = ?').get(A)!.wake_requested_at, null, 'sync does not wake');
   // The body is never read as data.
   assert.equal((await notify(good, msg({ id: 'webhook-0001', title: 'Injected', body: 'Not a message.' }))).status, 200);
-  assert.ok(w.raw.prepare('SELECT wake_requested_at FROM drive_accounts WHERE id = ?').get(A)!.wake_requested_at);
+  // The valid notification started a bounded run for that account (in the background).
+  const ran = () => w.raw.prepare('SELECT last_run_at FROM drive_accounts WHERE id = ?').get(A)!.last_run_at;
+  for (let i = 0; i < 100 && !ran(); i++) await new Promise((r) => setTimeout(r, 10));
+  assert.ok(ran());
   await w.drain(1);
   assert.equal(w.posts().length, 0);
   assert.ok(!JSON.stringify(w.raw.prepare('SELECT * FROM drive_channels').all()).includes(ch.token), 'tokens are stored only as digests');
@@ -682,9 +685,34 @@ test('Drive config: bounded, no folder reuse, https notifications, and fail-clos
   assert.ok(run({ ...CONFIG, notify_url: 'http://salon.test/x' }).problems.length > 0);
   assert.ok(run({ ...CONFIG, participants: [{ name: 'Z', account: 'account-c', outbox: 'o', inbox: 'i' }] }).problems.length > 0);
   assert.ok(!run({ ...CONFIG, participants: [{ name: 'X', account: A, outbox: 'secret-folder', inbox: 'secret-folder' }] }).problems.join(' ').includes('secret-folder'));
+  // Worker settings are all-or-nothing: the bridge config alone fails closed.
   const worker = workerConfig({ DRIVE_BRIDGE_CONFIG: JSON.stringify(CONFIG) });
   assert.equal(worker.ok, false);
-  assert.ok(!worker.ok && worker.problems.some((p) => /no Drive API client/.test(p)));
+  assert.ok(!worker.ok && worker.problems.some((p) => /all-or-nothing; missing: DRIVE_OAUTH_CLIENT_ID, DRIVE_OAUTH_CLIENT_SECRET, DRIVE_OAUTH_REFRESH_TOKENS/.test(p)));
+});
+
+test('Drive Worker config: off by default, all-or-nothing, validated, and never echoing secrets', () => {
+  const base = { DB: {}, REQUEST_LIMITER: { limit: () => undefined }, PARTICIPANT_LIMITER: { limit: () => undefined }, OWNER_TOKEN_SHA256: 'a'.repeat(64), TOKEN_PEPPER: 'q7Lr2Vx9Kp4Wm8Zt1Ys6Hn3Bc5Df0Gj2' };
+  const secrets = {
+    DRIVE_BRIDGE_CONFIG: JSON.stringify(CONFIG),
+    DRIVE_OAUTH_CLIENT_ID: 'synthetic-client-id.apps.local',
+    DRIVE_OAUTH_CLIENT_SECRET: 'synthetic-client-secret-0123456789',
+    DRIVE_OAUTH_REFRESH_TOKENS: JSON.stringify({ [A]: 'synthetic-refresh-token-account-a', [B]: 'synthetic-refresh-token-account-b' }),
+  };
+  const off = workerConfig(base);
+  assert.ok(off.ok && off.config.drive === null, 'no Drive settings: the bridge is off');
+  const on = workerConfig({ ...base, ...secrets });
+  assert.ok(on.ok && on.config.drive?.bridge.participants.length === 5 && on.config.drive.oauth.refreshTokens[A]);
+  const problems = (env: Record<string, string>) => { const r = workerConfig({ ...base, ...secrets, ...env }); return r.ok ? [] : r.problems; };
+  for (const k of Object.keys(secrets)) assert.ok(problems({ [k]: '' }).some((p) => /all-or-nothing/.test(p)), `missing ${k}`);
+  assert.ok(problems({ DRIVE_OAUTH_REFRESH_TOKENS: 'not json' }).some((p) => /JSON object/.test(p)));
+  assert.ok(problems({ DRIVE_OAUTH_REFRESH_TOKENS: JSON.stringify({ [A]: 'synthetic-refresh-token-account-a' }) }).some((p) => /one entry per configured Drive account/.test(p)));
+  assert.ok(problems({ DRIVE_OAUTH_REFRESH_TOKENS: JSON.stringify({ [A]: 'synthetic-refresh-token-account-a', [B]: 'has space' }) }).some((p) => /malformed/.test(p)));
+  assert.ok(problems({ DRIVE_OAUTH_CLIENT_SECRET: 'replace-me' }).some((p) => /placeholder/.test(p)));
+  assert.ok(problems({ DRIVE_BRIDGE_CONFIG: JSON.stringify({ ...CONFIG, notify_url: 'http://localhost/drive/notifications' }) }).some((p) => /must be https in the Worker/.test(p)));
+  const all = JSON.stringify([problems({ DRIVE_OAUTH_REFRESH_TOKENS: JSON.stringify({ [A]: 'synthetic-refresh-token-account-a', [B]: 'bad token' }) }),
+    problems({ DRIVE_OAUTH_CLIENT_SECRET: 'replace-me' })]);
+  assert.ok(!/synthetic-|bad token|replace-me|out-|in-/.test(all), 'problems name settings, never values');
 });
 
 for (const mode of ['retry', 'takeover', 'lost access'] as const) {

@@ -7,6 +7,10 @@ TOKEN_PEPPER=<at least 32 random characters>
 # MCP_RESOURCE=<https URL of this Worker's /mcp endpoint>
 # OAUTH_ISSUER=<issuer URL of the chosen authorization server>
 # OAUTH_JWKS_URL=<that issuer's JWKS URL>
-# Drive bridge (docs/drive-bridge.md). Not supported by this Worker build yet; setting it fails closed.
+# Drive bridge (docs/drive-bridge.md). Off unless all four are set; a partial set fails closed.
+# No grant or OAuth client exists yet; do not set these until the owner approves activation.
 # DRIVE_BRIDGE_CONFIG=<private JSON with account IDs and folder IDs>
+# DRIVE_OAUTH_CLIENT_ID=<OAuth client ID of the approved Google Cloud project>
+# DRIVE_OAUTH_CLIENT_SECRET=<that client's secret>
+# DRIVE_OAUTH_REFRESH_TOKENS=<JSON object: account id -> refresh token, one per configured account>
 # MCP_ALLOWED_ORIGINS=<optional comma-separated browser origins, e.g. https://client.example>

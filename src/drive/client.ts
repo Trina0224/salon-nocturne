@@ -28,7 +28,7 @@ export type DriveErrorKind = 'invalid_cursor' | 'auth' | 'not_found' | 'rate_lim
 
 export class DriveError extends Error {
   readonly kind: DriveErrorKind;
-  constructor(kind: DriveErrorKind, message = kind) {
+  constructor(kind: DriveErrorKind, message: string = kind) {
     super(message);
     this.kind = kind;
   }
