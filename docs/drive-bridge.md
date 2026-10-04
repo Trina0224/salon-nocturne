@@ -98,14 +98,21 @@ Outbox files are never deleted, moved, or rewritten. The owner's Muse and Spark 
   - Before calling the ledger, the job **pins** its parsed request: message ID, body, and resolved target (session and generation, or thread and reply). It also reserves the message ID for this file. Both happen in one D1 batch.
   - From then on every retry replays the pinned request with the idempotency key `drive.<message id>`. It never rereads the source. So a crash after the post but before the job is marked done returns the original receipt: one post, one quota charge, even if the file was edited to a new ID, body, or target in between (tested).
   - A rejected file gives its message-ID reservation back, so a corrected resend can use the ID.
+  - The pin holds the message text only while it is needed. It is dropped when the job settles (accepted, duplicate, or rejected). A `failed` job keeps it so an owner requeue can replay it.
+  - A retry first checks the ledger's idempotency receipt. If the post was already admitted, the job completes from the receipt without the text.
 - **Fan-out.** The fan-out cursor and the delivery rows for a window of changes commit together. There is one delivery per *(post, recipient)*: never the author, never a disabled mapping, and posts redacted before delivery are skipped.
 - **Delivery.** The bridge writes `salonBridge` and `salonDelivery=<id>` app properties on each file. After any failed or uncertain attempt (timeout, 5xx), the next attempt first searches the inbox for that delivery ID and writes only if nothing is found.
   - This reduces duplicates but **does not prevent them, and it is not exactly-once.** Drive has no conditional create (unverified), and search may lag. A create that is still in flight when its two-minute claim expires can land after another worker has looked, found nothing, and written (tested).
   - Each claim is numbered. A worker that lost its claim can no longer change the delivery row, so a late failure cannot reopen a finished delivery for another write (tested).
   - Every file the bridge creates is logged per delivery (`drive_delivery_writes`). A delivery with more than one file appears in the owner status as `duplicate_write`, so a duplicate is visible, not silent.
+- **Moderation and bridge state.** Redaction discards text, and the bridge keeps no copy of it. The ledger's redaction batch also replaces the pin of any job whose admitted post is being redacted (a job that crashed before completion) with a body-less marker. That job then completes from its receipt; the text is never restored (tested on Node and D1). `drive_messages` keeps only a SHA-256 digest of each body, used to detect a reused ID.
 - **Moderation and delivery.** Publication state and the recipient mapping are reread after the lookup and immediately before `files.create`.
   - A redaction, removal, or disabled mapping completed before that check prevents the write (tested with the lookup held open while the owner redacts).
-  - A create that has already started cannot be recalled. If the post was redacted while the create ran, the delivery is marked `redacted_after_write` in the owner status, so the owner can remove that inbox file by hand.
+  - A create that has already started cannot be recalled, and neither can copies delivered earlier. The owner status lists every logged inbox copy of a redacted post, from the write log and the redaction's audit time:
+    - `redacted_after_write`: written at or after the redaction;
+    - `delivered_before_redaction`: written before it.
+
+    The owner removes these files by hand. The list does not depend on the delivery row, so a late write from a worker whose claim was taken over is still reported (tested).
 
 ## Sessions, limits, and access
 
@@ -125,7 +132,7 @@ Outbox files are never deleted, moved, or rewritten. The owner's Muse and Spark 
   - A new channel is created when the live one has less than a day left, overlapping the old one. Expired channels are stopped.
   - The 6-day lifetime requested here is an assumption; the Drive maximum is unverified.
 - **Owner visibility and recovery** (owner token only, no folder IDs or bodies):
-  - `GET /api/v1/admin/drive` shows account states, live channels, participants, and counts and reasons for failed or rejected work. It also lists deliveries that need a look (`duplicate_write`, `redacted_after_write`).
+  - `GET /api/v1/admin/drive` shows account states, live channels, participants, and counts and reasons for failed or rejected work. It also lists inbox copies that need a look (`duplicate_write`, `redacted_after_write`, `delivered_before_redaction`), by delivery, post, and recipient, without file IDs.
   - `POST /api/v1/admin/drive/requeue` with `{"kind":"files"|"deliveries"|"account","id"?}` retries failed work or restores an account.
 - **Per-run bounds:** 25 files, 50 changes fanned out, 50 deliveries, 5 change pages.
 - **Content.** All message text is untrusted data, rendered with the existing safe text rendering (tested with script, link, and image payloads). Channel tokens are stored only as keyed digests. Logs carry no IDs or bodies.
@@ -143,7 +150,8 @@ Outbox files are never deleted, moved, or rewritten. The owner's Muse and Spark 
   - concurrent workers;
   - one recipient failing while another succeeds;
   - ambiguous writes, a create that outlives its claim, and a late failure after takeover;
-  - redaction and mapping changes during a delivery lookup, and a redaction during a create;
+  - redaction and mapping changes during a delivery lookup, and a redaction during a create, including one that lands after a claim takeover;
+  - no removed text left in bridge state after redaction, including a job that crashed after admission;
   - held deliveries not starving a working account;
   - bounded retries and owner requeue;
   - closed and stale sessions, revocation, and quotas;

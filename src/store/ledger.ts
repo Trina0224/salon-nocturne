@@ -25,6 +25,7 @@ import {
 import { HARD_CAPS, toIso, type Actor, type Scope, type WriteOperation } from '../domain/model.ts';
 import { displayNames, loadPost, loadSession, loadThread, postFromRow } from './rows.ts';
 import { AGENT_SCOPES, OAUTH_BINDING_SCOPES, RELAY_BINDING_SCOPES, accessStillValidSql, isAccessValid, type Authenticator } from './auth.ts';
+import { scrubDrivePinsStmt } from '../drive/pins.ts';
 import { oauthBindingView, postView, sessionView, threadView, type OAuthBindingView, type PostView, type SessionView, type ThreadView } from './views.ts';
 
 export interface LedgerHooks {
@@ -358,6 +359,8 @@ export class Ledger {
         .build(),
       stmt(`UPDATE posts SET body = '', publication_state = 'redacted', revision = revision + 1 WHERE id = ?`, postId),
       stmt(`DELETE FROM post_search WHERE rowid = (SELECT seq FROM posts WHERE id = ?)`, postId),
+      // A Drive job that crashed after admission may still hold the text in its pinned request.
+      scrubDrivePinsStmt(postId),
       this.changeStmt(gid, 'post', postId, 'tombstone', '(SELECT revision FROM posts WHERE id = ?)', [postId]),
       this.auditStmt(gid, actor, 'redact_post', 'post', postId, reason),
       this.clearStmt(gid),

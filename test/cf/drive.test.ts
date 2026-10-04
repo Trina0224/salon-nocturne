@@ -24,7 +24,8 @@ test('D1: Drive outbox to ledger to inboxes, with an edit, a duplicate, a failin
       { name: 'Rei', account: 'account-b', outbox: 'out-rei', inbox: 'in-rei' },
     ],
   }), [])!;
-  const s = await d1Salon({ clock, drive: { config, client: (a) => mock.client(a) } });
+  const crashOnce = new Set<string>();
+  const s = await d1Salon({ clock, drive: { config, client: (a) => mock.client(a), hooks: { afterPost: (f) => { if (crashOnce.delete(f)) throw new Error('crash after post'); } } } });
   try {
     const owner = await s.auth.resolve(OWNER_TOKEN);
     if (owner.kind !== 'ok') throw new Error('owner');
@@ -48,8 +49,8 @@ test('D1: Drive outbox to ledger to inboxes, with an edit, a duplicate, a failin
     assert.equal(mock.filesIn('in-grok').length, 0);
     const delivered = await s.db.first(`SELECT COUNT(*) AS n FROM drive_deliveries WHERE state = 'delivered'`);
     assert.equal(Number(delivered!.n), 2);
-    const pinned = await s.db.first(`SELECT pinned_request FROM drive_files WHERE state = 'accepted'`);
-    assert.match(String(pinned!.pinned_request), /grok-d1-01/);
+    const pinned = await s.db.first(`SELECT pinned_request, message_id FROM drive_files WHERE state = 'accepted'`);
+    assert.deepEqual([pinned!.pinned_request, pinned!.message_id], [null, 'grok-d1-01'], 'a settled job keeps no pinned text');
 
     // Invalid-cursor recovery over paginated outboxes, resumed across runs.
     mock.folderPageSize = 1;
@@ -68,6 +69,29 @@ test('D1: Drive outbox to ledger to inboxes, with an edit, a duplicate, a failin
     assert.deepEqual(recovered.map((p) => p.body), ['Recovered 0.', 'Recovered 1.', 'Recovered 2.', 'Recovered 3.', 'Recovered 4.', 'Recovered 5.']);
     const status = await bridge.status();
     assert.deepEqual(status.attention, []);
+
+    // Redaction on D1: a job that crashed after admission loses its pinned text in the redaction batch,
+    // completes from its receipt, and earlier inbox copies are listed for the owner.
+    const crashed = mock.addFile('account-b', 'out-rei', { content: 'salon-message: 1\nid: rei-d1-scrub\ntitle: Scrub\n---\nRemoved on D1.\n' });
+    crashOnce.add(crashed);
+    await bridge.runOnce('w1');
+    const job = await s.db.first('SELECT state, pinned_request FROM drive_files WHERE file_id = ?', crashed);
+    assert.equal(job!.state, 'pending');
+    assert.match(String(job!.pinned_request), /Removed on D1/);
+    const removed = (await s.db.first(`SELECT id FROM posts WHERE body = 'Removed on D1.'`))!;
+    clock.advance(1000);
+    await s.ledger.moderatePost(owner.actor, String(removed.id), { action: 'redact', reason: 'test', expected_revision: 1 });
+    const scrubbed = await s.db.first('SELECT pinned_request FROM drive_files WHERE file_id = ?', crashed);
+    assert.equal(JSON.parse(String(scrubbed!.pinned_request)).kind, 'admitted');
+    clock.advance(LIMITS.maxBackoffMs + 1);
+    await bridge.runOnce('w1');
+    const settled = await s.db.first('SELECT state, post_id, pinned_request FROM drive_files WHERE file_id = ?', crashed);
+    assert.deepEqual([settled!.state, settled!.post_id, settled!.pinned_request], ['accepted', removed.id, null]);
+    const everything = JSON.stringify(await s.db.all('SELECT * FROM drive_files')) + JSON.stringify(await s.db.all('SELECT * FROM drive_messages'));
+    assert.ok(!everything.includes('Removed on D1'));
+    const after = await bridge.status();
+    assert.ok(after.attention.length > 0);
+    assert.ok(after.attention.every((a) => a.reason === 'delivered_before_redaction' && a.post_id === removed.id));
   } finally {
     await s.dispose();
   }

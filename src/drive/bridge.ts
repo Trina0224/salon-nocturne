@@ -67,7 +67,9 @@ export interface BridgeHooks {
 /** The exact ledger request a file job replays on every retry once pinned. */
 type PinnedRequest =
   | { kind: 'thread'; messageId: string; sessionId: string; generation: number; title: string; tags: string[]; body: string }
-  | { kind: 'post'; messageId: string; threadId: string; raw: Record<string, unknown> };
+  | { kind: 'post'; messageId: string; threadId: string; raw: Record<string, unknown> }
+  /** Left by a redaction (src/drive/pins.ts): admitted, text discarded; complete from the receipt. */
+  | { kind: 'admitted'; messageId: string };
 
 const iso = (ms: number) => new Date(ms).toISOString();
 
@@ -407,21 +409,26 @@ export class DriveBridge {
         if (!prepared) return;
         pin = prepared;
       }
-      const actor = await this.actor(participantId);
-      if (!actor) return this.finishFile(fileId, 'rejected', 'participant_unavailable');
-      const key = `drive.${pin.messageId}`;
-      let postId: string;
-      if (pin.kind === 'thread') {
-        const r = await this.ledger.createThread(actor, pin.sessionId, { title: pin.title, tags: pin.tags, body: pin.body, generation: pin.generation }, key);
-        postId = r.value.post.id;
-      } else {
-        const r = await this.ledger.createPost(actor, pin.threadId, pin.raw, key);
-        postId = r.value.id;
+      // Already admitted (a crash before completion): finish from the ledger's receipt, without the text.
+      let postId = await this.admittedPost(participantId, pin.messageId);
+      if (!postId) {
+        if (pin.kind === 'admitted') return this.finishFile(fileId, 'rejected', 'removed_by_moderation');
+        const actor = await this.actor(participantId);
+        if (!actor) return this.finishFile(fileId, 'rejected', 'participant_unavailable');
+        const key = `drive.${pin.messageId}`;
+        if (pin.kind === 'thread') {
+          const r = await this.ledger.createThread(actor, pin.sessionId, { title: pin.title, tags: pin.tags, body: pin.body, generation: pin.generation }, key);
+          postId = r.value.post.id;
+        } else {
+          const r = await this.ledger.createPost(actor, pin.threadId, pin.raw, key);
+          postId = r.value.id;
+        }
+        await this.hooks.afterPost?.(fileId);
       }
-      await this.hooks.afterPost?.(fileId);
+      // Settled: the pinned copy of the text is no longer needed.
       await this.db.batch([
         stmt(`UPDATE drive_messages SET post_id = ? WHERE participant_id = ? AND message_id = ? AND file_id = ?`, postId, participantId, pin.messageId, fileId),
-        stmt(`UPDATE drive_files SET state = 'accepted', message_id = ?, post_id = ?, reason = NULL, updated_at = ? WHERE file_id = ? AND state = 'pending'`,
+        stmt(`UPDATE drive_files SET state = 'accepted', message_id = ?, post_id = ?, reason = NULL, pinned_request = NULL, updated_at = ? WHERE file_id = ? AND state = 'pending'`,
           pin.messageId, postId, this.now(), fileId),
       ]);
     } catch (err) {
@@ -435,6 +442,17 @@ export class DriveBridge {
       }
       await this.retryFile(fileId, Number(job.attempts), err);
     }
+  }
+
+  /** The post this participant's message already produced, from the ledger's idempotency receipt. */
+  private async admittedPost(participantId: string, messageId: string): Promise<string | null> {
+    const r = await this.db.first(
+      `SELECT result_type, result_id FROM write_receipts WHERE participant_id = ? AND idempotency_key = ? ORDER BY created_at DESC LIMIT 1`,
+      participantId, `drive.${messageId}`);
+    if (!r) return null;
+    if (r.result_type === 'post') return String(r.result_id);
+    const first = await this.db.first('SELECT id FROM posts WHERE thread_id = ? ORDER BY seq LIMIT 1', String(r.result_id));
+    return first ? String(first.id) : null;
   }
 
   /**
@@ -527,9 +545,11 @@ export class DriveBridge {
 
   private async finishFile(fileId: string, state: 'rejected' | 'duplicate' | 'failed', reason: string, messageId?: string, postId?: string | null) {
     const statements = [stmt(
-      `UPDATE drive_files SET state = ?, reason = ?, message_id = COALESCE(?, message_id), post_id = COALESCE(?, post_id), updated_at = ?
+      // A failed job keeps its pin so an owner requeue replays it; settled ones drop it.
+      `UPDATE drive_files SET state = ?, reason = ?, message_id = COALESCE(?, message_id), post_id = COALESCE(?, post_id),
+         pinned_request = CASE WHEN ? = 'failed' THEN pinned_request END, updated_at = ?
        WHERE file_id = ? AND state = 'pending'`,
-      state, reason, messageId ?? null, postId ?? null, this.now(), fileId)];
+      state, reason, messageId ?? null, postId ?? null, state, this.now(), fileId)];
     // A refused file gives its message-ID reservation back, so a corrected resend can use it.
     if (state === 'rejected') statements.push(stmt(`DELETE FROM drive_messages WHERE file_id = ? AND post_id IS NULL`, fileId));
     await this.db.batch(statements);
@@ -679,6 +699,7 @@ export class DriveBridge {
       // Every created file is logged, even by a worker that lost its claim, so duplicates are visible.
       await this.db.run(`INSERT OR IGNORE INTO drive_delivery_writes (delivery_id, remote_file_id, attempt, created_at) VALUES (?, ?, ?, ?)`,
         id, created.id, claimNo, this.now());
+      // If the post was redacted while the create ran, the write log and owner status report it.
       const after = await loadPost(this.db, post.id);
       const note = after?.publicationState === 'published' ? null : 'redacted_after_write';
       return this.endDelivery(id, claimNo, 'delivered', note, created.id);
@@ -737,11 +758,24 @@ export class DriveBridge {
         `SELECT 'file' AS kind, file_id AS id, participant_id, reason FROM drive_files WHERE state IN ('failed', 'rejected')
          UNION ALL SELECT 'delivery', id, recipient_id, last_error FROM drive_deliveries WHERE state = 'failed'
          ORDER BY kind LIMIT 50`),
-      // Deliveries needing a look: more than one inbox file written, or redacted while being written.
+      // Inbox copies needing the owner's attention, derived from the write log
+      // (not from the delivery row, which a stale worker may no longer update):
+      // a delivery written more than once, and every logged copy of a post that
+      // has since been redacted. A copy written at or after the redaction is
+      // 'redacted_after_write'; an earlier one is 'delivered_before_redaction'.
+      // Redaction cannot recall either; the owner removes them by hand.
       attention: await this.db.all(
-        `SELECT d.id, d.recipient_id, CASE WHEN w.n > 1 THEN 'duplicate_write' ELSE d.last_error END AS reason, COALESCE(w.n, 0) AS writes
-         FROM drive_deliveries d LEFT JOIN (SELECT delivery_id, COUNT(*) AS n FROM drive_delivery_writes GROUP BY delivery_id) w ON w.delivery_id = d.id
-         WHERE w.n > 1 OR d.last_error = 'redacted_after_write' ORDER BY d.created_at LIMIT 50`),
+        `SELECT * FROM (
+           SELECT d.id, d.post_id, d.recipient_id, 'duplicate_write' AS reason, w.n AS writes, d.created_at AS at
+           FROM drive_deliveries d JOIN (SELECT delivery_id, COUNT(*) AS n FROM drive_delivery_writes GROUP BY delivery_id) w ON w.delivery_id = d.id
+           WHERE w.n > 1
+           UNION ALL
+           SELECT d.id, d.post_id, d.recipient_id,
+             CASE WHEN r.at IS NULL OR w.created_at >= r.at THEN 'redacted_after_write' ELSE 'delivered_before_redaction' END, 1, w.created_at
+           FROM drive_delivery_writes w JOIN drive_deliveries d ON d.id = w.delivery_id JOIN posts p ON p.id = d.post_id
+             LEFT JOIN (SELECT target_id, MIN(at) AS at FROM audit_log WHERE action = 'redact_post' AND target_type = 'post' GROUP BY target_id) r ON r.target_id = p.id
+           WHERE p.publication_state = 'redacted'
+         ) ORDER BY at, id LIMIT 50`),
     };
   }
 

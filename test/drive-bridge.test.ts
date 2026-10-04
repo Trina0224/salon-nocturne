@@ -581,6 +581,94 @@ test('Drive: a worker that lost its claim cannot reopen a delivery another worke
   for (const n of ['Spark', 'Rei', 'Claude', 'Muse'] as const) assert.equal(w.inboxOf(n).length, 1, n);
 });
 
+test('Drive: redaction leaves no copy of the removed text in bridge state, including a job that crashed after admission', async () => {
+  const crashOnce = new Set<string>();
+  const w = await driveWorld({ hooks: { afterPost: (fileId) => { if (crashOnce.delete(fileId)) throw new Error('crash after post'); } } });
+  const redact = async (postId: string) => {
+    const r = await w.call('POST', `/api/v1/admin/posts/${postId}/moderate`, { token: TOKENS.owner, body: { action: 'redact', reason: 'test', expected_revision: 1 } });
+    assert.equal(r.status, 200);
+  };
+  const tables = ['drive_files', 'drive_messages', 'drive_deliveries', 'drive_delivery_writes', 'drive_accounts', 'drive_channels', 'drive_state', 'drive_participants'];
+  const bridgeState = () => JSON.stringify(tables.map((t) => w.raw.prepare(`SELECT * FROM ${t}`).all()));
+
+  // Normal acceptance: the pin is dropped when the job settles, before any redaction.
+  const normal = w.write('Muse', msg({ id: 'muse-scrub-1', title: 'Accepted', body: 'Secret accepted text.' }));
+  await w.drain(2);
+  assert.equal(w.file(normal).state, 'accepted');
+  assert.equal(w.file(normal).pinned_request, null);
+  w.clock.advance(1000);
+  await redact(w.file(normal).post_id as string);
+  assert.ok(!bridgeState().includes('Secret accepted text'));
+
+  // Crash after admission, then redaction, then recovery: a new thread and a reply (both receipt kinds).
+  const opener = w.write('Grok', msg({ id: 'grok-scrub-1', title: 'Crashed opener', body: 'Secret opener text.' }));
+  crashOnce.add(opener);
+  await w.bridge.runOnce('worker-1');
+  const openerPost = w.posts().find((p) => p.author_id === w.ids.Grok)!;
+  const reply = w.write('Spark', msg({ id: 'spark-scrub-1', replyTo: openerPost.id, body: 'Secret reply text.' }));
+  crashOnce.add(reply);
+  await w.bridge.runOnce('worker-1');
+  const replyPost = w.posts().find((p) => p.author_id === w.ids.Spark)!;
+  for (const f of [opener, reply]) {
+    assert.equal(w.file(f).state, 'pending');
+    assert.match(String(w.file(f).pinned_request), /Secret/, 'pinned before the redaction');
+  }
+  w.clock.advance(1000);
+  await redact(openerPost.id);
+  await redact(replyPost.id);
+  // The redaction batch itself replaced both pins with body-less markers.
+  assert.ok(!bridgeState().includes('Secret'), 'no removed text anywhere in bridge state');
+  assert.equal(JSON.parse(String(w.file(opener).pinned_request)).kind, 'admitted');
+  // Recovery completes from the receipts; nothing is re-posted or restored.
+  w.clock.advance(LIMITS.baseBackoffMs + 1);
+  await w.bridge.runOnce('worker-1');
+  assert.equal(w.file(opener).state, 'accepted');
+  assert.equal(w.file(opener).post_id, openerPost.id);
+  assert.equal(w.file(reply).state, 'accepted');
+  assert.equal(w.file(reply).post_id, replyPost.id);
+  assert.equal(w.posts().length, 3);
+  assert.deepEqual(w.posts().map((p) => p.body), ['', '', '']);
+  assert.ok(!bridgeState().includes('Secret'));
+  // Copies delivered before the redaction cannot be recalled; the owner status lists them for removal.
+  const status = (await w.call('GET', '/api/v1/admin/drive', { token: TOKENS.owner })).body;
+  const delivered = Number(w.raw.prepare(`SELECT COUNT(*) AS n FROM drive_delivery_writes x JOIN drive_deliveries d ON d.id = x.delivery_id
+    WHERE d.post_id IN (?, ?, ?)`).get(openerPost.id, replyPost.id, w.file(normal).post_id)!.n);
+  assert.ok(delivered > 0);
+  assert.equal(status.attention.filter((a: Json) => a.reason === 'delivered_before_redaction').length, delivered);
+  assert.ok(!JSON.stringify(status).includes('Secret'));
+});
+
+test('Drive: a redacted write that lands after another worker took over its claim is still reported for cleanup', async () => {
+  const w = await driveWorld();
+  w.write('Grok', msg({ id: 'grok-take-01', title: 'Takeover', body: 'Old text written late.' }));
+  await w.bridge.runAccount(A, 'worker-1');
+  await w.bridge.processFiles();
+  await w.bridge.fanOut();
+  const post = w.posts()[0];
+  const stalled = w.mock.block('createTextFile', { account: B });
+  const first = w.bridge.deliver();
+  await stalled.reached;
+  w.clock.advance(1000);
+  const r = await w.call('POST', `/api/v1/admin/posts/${post.id}/moderate`, { token: TOKENS.owner, body: { action: 'redact', reason: 'test', expected_revision: 1 } });
+  assert.equal(r.status, 200);
+  // The claim expires; a second worker settles the delivery as skipped.
+  w.clock.advance(LIMITS.claimMs + 1);
+  await w.bridge.deliver();
+  stalled.release();
+  await first;
+  // Only account B's create was held. (Spark, on account A, may have been served before the redaction.)
+  const late = PEOPLE.filter((p) => p.account === B).map((p) => p.name).filter((n) => w.inboxOf(n).some((t) => t.includes('Old text written late.')));
+  assert.equal(late.length, 1, 'exactly one late file landed');
+  const lateId = w.ids[late[0]!];
+  const row = w.raw.prepare('SELECT * FROM drive_deliveries WHERE post_id = ? AND recipient_id = ?').get(post.id, lateId) as Json;
+  assert.equal(row.state, 'skipped', 'the claim fence kept the stale worker from changing the row');
+  assert.equal(w.raw.prepare('SELECT COUNT(*) AS n FROM drive_delivery_writes WHERE delivery_id = ?').get(row.id)!.n, 1);
+  const status = (await w.call('GET', '/api/v1/admin/drive', { token: TOKENS.owner })).body;
+  const flagged = status.attention.filter((a: Json) => a.reason === 'redacted_after_write');
+  assert.deepEqual(flagged.map((a: Json) => [a.id, a.post_id, a.recipient_id]), [[row.id, post.id, lateId]]);
+  assert.ok(!JSON.stringify(status).includes('Old text'), 'status carries no bodies');
+});
+
 test('Drive config: bounded, no folder reuse, https notifications, and fail-closed in the Worker', () => {
   const run = (c: unknown) => {
     const problems: string[] = [];
