@@ -24,6 +24,7 @@ import type { Limiters, AppEnv } from '../api/app.ts';
 import type { Ledger } from '../store/ledger.ts';
 import type { ReadModel } from '../store/reads.ts';
 import { resolveOAuthBinding, type Authenticator } from '../store/auth.ts';
+import type { AdminRelay } from '../store/relay.ts';
 import { challenge, protectedResourceMetadata, READ_SCOPES, TokenVerifier } from './oauth.ts';
 import { checkArgs, describeTools, findTool, toolScopes, type ToolContext } from './tools.ts';
 
@@ -47,6 +48,7 @@ export interface McpDeps {
   ledger: Ledger;
   reads: ReadModel;
   limiters: Limiters;
+  relay: AdminRelay | null;
 }
 
 type RpcId = string | number;
@@ -127,8 +129,8 @@ export function mcpRoutes(deps: McpDeps): Hono<AppEnv> {
         return refuse(c, 403, 'This connection has been revoked. Stop session work.');
       }
       const actor = bound.actor;
-      if (!actor.scopes.includes('read')) {
-        return refuse(c, 403, 'This token does not grant salon:read.', {
+      if (!actor.scopes.includes('read') && !actor.scopes.includes('relay')) {
+        return refuse(c, 403, 'This token grants no salon scope this binding allows.', {
           'WWW-Authenticate': challenge(config, { error: 'insufficient_scope', scopes: READ_SCOPES }),
         });
       }
@@ -162,7 +164,7 @@ export function mcpRoutes(deps: McpDeps): Hono<AppEnv> {
       if (typeof req.id !== 'string' && typeof req.id !== 'number') return c.json(rpcError(null, -32600, 'Invalid id.'), 400);
 
       c.header('Cache-Control', 'no-store');
-      const ctx: ToolContext = { actor, label: bound.label, reads: deps.reads, ledger: deps.ledger };
+      const ctx: ToolContext = { actor, label: bound.label, reads: deps.reads, ledger: deps.ledger, relay: deps.relay };
       try {
         return c.json(await dispatch(config, ctx, req as RpcRequest & { id: RpcId }));
       } catch {
@@ -204,10 +206,10 @@ async function dispatch(config: McpConfig, ctx: ToolContext, req: RpcRequest & {
 }
 
 async function callTool(config: McpConfig, ctx: ToolContext, req: RpcRequest & { id: RpcId }) {
-  const tool = findTool(req.params?.name);
+  const tool = findTool(req.params?.name, ctx.actor);
   if (!tool) return rpcError(req.id, -32602, 'Unknown tool.');
   const scopes = toolScopes(tool);
-  if (!ctx.actor.scopes.includes(scopes.need)) {
+  if (scopes && !ctx.actor.scopes.includes(scopes.need)) {
     // A tool error with a challenge lets the client ask the user for more scope.
     const text = `This connection lacks the "${scopes.need}" permission (OAuth scope salon:${scopes.need}).`;
     return rpcResult(req.id, {

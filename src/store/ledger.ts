@@ -24,7 +24,8 @@ import {
 } from '../domain/content.ts';
 import { HARD_CAPS, toIso, type Actor, type Scope, type WriteOperation } from '../domain/model.ts';
 import { displayNames, loadPost, loadSession, loadThread, postFromRow } from './rows.ts';
-import { AGENT_SCOPES, OAUTH_BINDING_SCOPES, accessStillValidSql, isAccessValid, type Authenticator } from './auth.ts';
+import { AGENT_SCOPES, OAUTH_BINDING_SCOPES, RELAY_BINDING_SCOPES, accessStillValidSql, isAccessValid, type Authenticator } from './auth.ts';
+import { scrubDrivePinsStmt } from '../drive/pins.ts';
 import { oauthBindingView, postView, sessionView, threadView, type OAuthBindingView, type PostView, type SessionView, type ThreadView } from './views.ts';
 
 export interface LedgerHooks {
@@ -111,9 +112,26 @@ function admissionError(reason: string, notFoundWhat: string): ApiError {
       return invalid('The owner identity is managed through configuration, not this route.');
     case 'PARTICIPANT_REVOKED':
       return new ApiError(409, 'REVOKED', 'This participant is revoked; create a new participant instead.');
+    case 'NOT_APPROVED':
+      return new ApiError(409, 'APPROVAL_REQUIRED', 'The owner has not approved this operation.');
+    case 'APPROVAL_EXPIRED':
+      return new ApiError(409, 'APPROVAL_EXPIRED', 'The approval has expired. Ask the owner to approve a new request.');
+    case 'APPROVAL_REVOKED':
+      return new ApiError(409, 'APPROVAL_REVOKED', 'The owner revoked this approval. Do not retry.', true);
+    case 'APPROVAL_USED':
+      return new ApiError(409, 'APPROVAL_USED', 'This approval has already been used.');
+    case 'WRONG_EXECUTOR':
+      return new ApiError(403, 'FORBIDDEN', 'This approval was issued for a different relay.');
     default:
       return new ApiError(500, 'INTERNAL', 'Admission failed.');
   }
+}
+
+function alreadyBound(err: unknown): unknown {
+  if (isUniqueViolation(err, 'credentials')) {
+    return new ApiError(409, 'IDENTITY_ALREADY_BOUND', 'This identity has an active binding. Revoke it first to move or replace it.');
+  }
+  return err;
 }
 
 const quotaExhausted = (what: string) =>
@@ -341,6 +359,8 @@ export class Ledger {
         .build(),
       stmt(`UPDATE posts SET body = '', publication_state = 'redacted', revision = revision + 1 WHERE id = ?`, postId),
       stmt(`DELETE FROM post_search WHERE rowid = (SELECT seq FROM posts WHERE id = ?)`, postId),
+      // A Drive job that crashed after admission may still hold the text in its pinned request.
+      scrubDrivePinsStmt(postId),
       this.changeStmt(gid, 'post', postId, 'tombstone', '(SELECT revision FROM posts WHERE id = ?)', [postId]),
       this.auditStmt(gid, actor, 'redact_post', 'post', postId, reason),
       this.clearStmt(gid),
@@ -439,6 +459,11 @@ export class Ledger {
   async bindOAuthIdentity(actor: Actor, issuer: string, raw: Body): Promise<{ binding: OAuthBindingView }> {
     this.requireOwner(actor);
     rejectFields(raw, ['issuer', 'scopes', 'role']);
+    // A posting binding reads and posts as the participant. A relay binding
+    // can only propose administrative operations and execute the ones the
+    // owner approved for it; it cannot read, post, or approve.
+    const purpose = raw.purpose === undefined ? 'posting' : raw.purpose;
+    if (purpose !== 'posting' && purpose !== 'relay') throw invalid('purpose must be "posting" or "relay".');
     const participantId = validateTitle(raw.participant_id, 'participant_id', 64);
     const subject = validateOAuthSubject(raw.subject);
     const label = validateTitle(raw.label, 'label', 60);
@@ -446,10 +471,12 @@ export class Ledger {
     if (typeof confirmOwner !== 'boolean') throw invalid('confirm_owner must be a boolean.');
     const target = await this.db.first('SELECT role FROM participants WHERE id = ?', participantId);
     if (!target) throw notFound('Participant');
+    if (target.role === 'owner' && purpose === 'relay') throw invalid('A relay binding must belong to an agent participant.');
     if (target.role === 'owner' && !confirmOwner) {
       throw invalid('Binding an identity to the owner gives it host posting rights. Repeat with "confirm_owner": true if that is intended.');
     }
     const digest = await this.auth.oauthIdentityDigest(issuer, subject);
+    const scopes = purpose === 'relay' ? RELAY_BINDING_SCOPES : OAUTH_BINDING_SCOPES;
     const bindingId = newId('cred');
     const gid = newId('adm');
     const now = this.clock.sqlNow();
@@ -462,30 +489,80 @@ export class Ledger {
                                               WHEN p.status = 'revoked' THEN 'PARTICIPANT_REVOKED' END`, gid)
           .add(`FROM (SELECT ${now.sql} AS at) n LEFT JOIN participants p ON p.id = ?`, ...now.params, participantId)
           .build(),
-        // Rebinding after revocation: a revoked binding for this identity
-        // gives up the digest (it keeps its ID, participant, and revocation;
-        // it is never reactivated), so the new row below, with a fresh ID,
-        // can take it. An active binding is left alone, so the insert then
-        // violates the digest's uniqueness and the whole batch rolls back:
-        // at most one active binding per identity, even under concurrency.
-        stmt(`UPDATE credentials SET token_digest = 'retired:' || id
-              WHERE token_digest = ? AND kind = 'oauth' AND revoked_at IS NOT NULL`, digest),
-        stmt(`INSERT INTO credentials (id, participant_id, token_digest, scopes, label, created_at, kind)
-              SELECT ?, ?, ?, ?, ?, at, 'oauth' FROM admissions WHERE id = ?`,
-          bindingId, participantId, digest, JSON.stringify(OAUTH_BINDING_SCOPES), label, gid),
-        this.auditStmt(gid, actor, 'bind_oauth_identity', 'participant', participantId, label),
+        ...this.bindingStmts(gid, bindingId, participantId, digest, scopes, label),
+        this.auditStmt(gid, actor, purpose === 'relay' ? 'bind_relay_identity' : 'bind_oauth_identity', 'participant', participantId, label),
         this.clearStmt(gid),
       ]);
     } catch (err) {
-      if (isUniqueViolation(err, 'credentials')) {
-        throw new ApiError(409, 'IDENTITY_ALREADY_BOUND', 'This identity has an active binding. Revoke it first to move or replace it.');
-      }
-      throw err;
+      throw alreadyBound(err);
     }
+    return { binding: await this.bindingView(bindingId) };
+  }
+
+  /**
+   * OAuth-only enrollment: a new agent participant and its posting binding in
+   * one batch. No REST bearer token is minted, so no credential exists that
+   * could leak through a response, a chat, or a log.
+   */
+  async enrollParticipantOAuth(actor: Actor, issuer: string, raw: Body): Promise<{ participant: { id: string; display_name: string }; binding: OAuthBindingView }> {
+    this.requireOwner(actor);
+    rejectFields(raw, ['issuer', 'scopes', 'role', 'purpose', 'confirm_owner']);
+    const displayName = validateTitle(raw.display_name, 'display_name', 60);
+    const subject = validateOAuthSubject(raw.oauth_subject);
+    const label = validateTitle(raw.label, 'label', 60);
+    const digest = await this.auth.oauthIdentityDigest(issuer, subject);
+    const participantId = newId('p');
+    const bindingId = newId('cred');
+    const gid = newId('adm');
+    const now = this.clock.sqlNow();
+    try {
+      await this.admit('Participant', [
+        new Query()
+          .add(`INSERT INTO admissions (id, at, seq, session_id, reason) SELECT ?, n.at, 0, NULL, NULL`, gid)
+          .add(`FROM (SELECT ${now.sql} AS at) n`, ...now.params)
+          .build(),
+        this.participantInsertStmt(gid, participantId, displayName),
+        ...this.bindingStmts(gid, bindingId, participantId, digest, OAUTH_BINDING_SCOPES, label),
+        this.auditStmt(gid, actor, 'enroll_participant_oauth', 'participant', participantId, label),
+        this.clearStmt(gid),
+      ]);
+    } catch (err) {
+      throw alreadyBound(err);
+    }
+    return { participant: { id: participantId, display_name: displayName }, binding: await this.bindingView(bindingId) };
+  }
+
+  /** @internal Binding view by ID (no digest, issuer, or subject). */
+  async bindingView(bindingId: string): Promise<OAuthBindingView> {
     const r = await this.db.first(
       `SELECT c.id, c.participant_id, c.label, c.scopes, c.created_at, c.revoked_at, p.display_name, p.role
        FROM credentials c JOIN participants p ON p.id = c.participant_id WHERE c.id = ?`, bindingId);
-    return { binding: oauthBindingView(r!) };
+    return oauthBindingView(r!);
+  }
+
+  /**
+   * @internal Statements that give an identity digest a new binding row.
+   * Rebinding after revocation: a revoked binding for this identity gives up
+   * the digest (it keeps its ID, participant, and revocation; it is never
+   * reactivated), so the new row, with a fresh ID, can take it. An active
+   * binding is left alone, so the insert then violates the digest's
+   * uniqueness and the whole batch rolls back: at most one active binding
+   * per identity, even under concurrency.
+   */
+  bindingStmts(gid: string, bindingId: string, participantId: string, digest: string, scopes: Scope[], label: string): Statement[] {
+    return [
+      stmt(`UPDATE credentials SET token_digest = 'retired:' || id
+            WHERE token_digest = ? AND kind = 'oauth' AND revoked_at IS NOT NULL`, digest),
+      stmt(`INSERT INTO credentials (id, participant_id, token_digest, scopes, label, created_at, kind)
+            SELECT ?, ?, ?, ?, ?, at, 'oauth' FROM admissions WHERE id = ?`,
+        bindingId, participantId, digest, JSON.stringify(scopes), label, gid),
+    ];
+  }
+
+  /** @internal */
+  participantInsertStmt(gid: string, participantId: string, displayName: string): Statement {
+    return stmt(`INSERT INTO participants (id, display_name, role, status, created_at)
+                 SELECT ?, ?, 'agent', 'active', at FROM admissions WHERE id = ?`, participantId, displayName, gid);
   }
 
   // ---- admission internals --------------------------------------------------
@@ -502,7 +579,7 @@ export class Ledger {
    * instead of a misleading quota or rate error. Revocation is never replayed
    * past: a REVOKED guard result always stands.
    */
-  private async admit(notFoundWhat: string, statements: Statement[], committedReceipt?: () => Promise<string | null>): Promise<boolean> {
+  /** @internal */ async admit(notFoundWhat: string, statements: Statement[], committedReceipt?: () => Promise<string | null>): Promise<boolean> {
     try {
       await this.db.batch(statements);
       return true;
@@ -570,25 +647,25 @@ export class Ledger {
       credentialId, participantId, digest, JSON.stringify(AGENT_SCOPES), gid);
   }
 
-  private auditStmt(gid: string, actor: Actor, action: string, targetType: string, targetId: string, reason: string | null): Statement {
+  /** @internal */ auditStmt(gid: string, actor: Actor, action: string, targetType: string, targetId: string, reason: string | null): Statement {
     return stmt(`INSERT INTO audit_log (actor_id, action, target_type, target_id, reason, at)
                  SELECT ?, ?, ?, ?, ?, at FROM admissions WHERE id = ?`, actor.participantId, action, targetType, targetId, reason, gid);
   }
 
-  private clearStmt(gid: string): Statement {
+  /** @internal */ clearStmt(gid: string): Statement {
     return stmt('DELETE FROM admissions WHERE id = ?', gid);
   }
 
-  private requireOwner(actor: Actor): void {
+  /** @internal */ requireOwner(actor: Actor): void {
     if (actor.role !== 'owner' || !actor.scopes.includes('admin')) throw forbidden('Only the owner may do this.');
   }
 
-  private requireScope(actor: Actor, scope: Scope): void {
+  /** @internal */ requireScope(actor: Actor, scope: Scope): void {
     if (!actor.scopes.includes(scope)) throw forbidden(`This credential lacks the "${scope}" scope.`);
   }
 
   /** Replays and early reads still require current access. */
-  private async requireAccess(actor: Actor): Promise<void> {
+  /** @internal */ async requireAccess(actor: Actor): Promise<void> {
     if (!(await isAccessValid(this.db, actor))) {
       throw new ApiError(403, 'REVOKED', 'This credential has been revoked. Stop session work.', true);
     }

@@ -7,4 +7,6 @@ TOKEN_PEPPER=<at least 32 random characters>
 # MCP_RESOURCE=<https URL of this Worker's /mcp endpoint>
 # OAUTH_ISSUER=<issuer URL of the chosen authorization server>
 # OAUTH_JWKS_URL=<that issuer's JWKS URL>
+# Drive bridge (docs/drive-bridge.md). Not supported by this Worker build yet; setting it fails closed.
+# DRIVE_BRIDGE_CONFIG=<private JSON with account IDs and folder IDs>
 # MCP_ALLOWED_ORIGINS=<optional comma-separated browser origins, e.g. https://client.example>

@@ -55,7 +55,7 @@ test('D1: migrations apply with the Wrangler CLI and are idempotent', async () =
     for (const table of ['sessions', 'posts', 'changes', 'write_receipts', 'admissions', 'credentials', 'post_search']) {
       assert.equal(await count(`SELECT COUNT(*) AS n FROM sqlite_master WHERE name = ?`, table), 1, table);
     }
-    assert.equal(await count('SELECT COUNT(*) AS n FROM d1_migrations'), 3);
+    assert.equal(await count('SELECT COUNT(*) AS n FROM d1_migrations'), 5);
     assert.equal(await count(`SELECT COUNT(*) AS n FROM pragma_table_info('credentials') WHERE name = 'kind'`), 1, 'migration 0003');
     assert.equal(await count('SELECT COUNT(*) AS n FROM admissions'), 0, 'guard rows never persist');
   } finally {
@@ -345,7 +345,7 @@ test('D1: the recovery capture, reapply, and verify SQL run through wrangler d1 
     writeFileSync(join(scratch, 'reapply.sql'), script('reapply', file));
     exec(['--file', join(scratch, 'reapply.sql')]);
     const verify = JSON.parse(exec(['--json', '--command', script('verify', file)]))[0].results[0];
-    assert.deepEqual(verify, { unredacted_posts: 0, searchable_redacted_posts: 0, active_revoked_participants: 0, live_revoked_credentials: 0, reopened_sessions: 0, sequence_behind: 1 },
+    assert.deepEqual(verify, { unredacted_posts: 0, searchable_redacted_posts: 0, active_revoked_participants: 0, live_revoked_credentials: 0, reopened_sessions: 0, sequence_behind: 1, open_admin_operations: 0 },
       'with no session to anchor the marker, the verify step reports the sequence as behind');
   } finally {
     rmSync(state, { recursive: true, force: true });

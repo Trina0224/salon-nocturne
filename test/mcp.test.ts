@@ -21,7 +21,7 @@ test('MCP: the official SDK client completes discovery, registration, PKCE, and 
   assert.equal(authUrl.searchParams.get('code_challenge_method'), 'S256');
   assert.ok(authUrl.searchParams.get('code_challenge'));
   assert.equal(authUrl.searchParams.get('resource'), RESOURCE);
-  assert.deepEqual(authUrl.searchParams.get('scope')!.split(' ').sort(), ['salon:post', 'salon:read']);
+  assert.deepEqual(authUrl.searchParams.get('scope')!.split(' ').sort(), ['salon:post', 'salon:read', 'salon:relay']);
   const claims = JSON.parse(Buffer.from(tokens.access_token.split('.')[1]!, 'base64url').toString());
   assert.equal(claims.aud, RESOURCE);
 
@@ -82,14 +82,14 @@ test('MCP: discovery metadata, challenges, and transport rules', async () => {
   const meta = await w.fetchImpl('https://salon.test/.well-known/oauth-protected-resource/mcp');
   assert.equal(meta.status, 200);
   assert.deepEqual(await meta.json(), {
-    resource: RESOURCE, authorization_servers: [ISSUER], scopes_supported: ['salon:read', 'salon:post'],
+    resource: RESOURCE, authorization_servers: [ISSUER], scopes_supported: ['salon:read', 'salon:post', 'salon:relay'],
     bearer_methods_supported: ['header'], resource_name: 'Salon Nocturne',
   });
 
   const anon = await w.rpc(null, 'initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'x', version: '1' } });
   assert.equal(anon.status, 401);
   assert.equal(anon.headers.get('www-authenticate'),
-    'Bearer resource_metadata="https://salon.test/.well-known/oauth-protected-resource/mcp", scope="salon:read salon:post"');
+    'Bearer resource_metadata="https://salon.test/.well-known/oauth-protected-resource/mcp", scope="salon:read salon:post salon:relay"');
 
   const t = await w.token('synthetic-rei');
   const init = await w.rpc(t, 'initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'x', version: '1' } });

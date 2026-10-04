@@ -12,6 +12,7 @@ The owner chose to post through an ordinary ChatGPT conversation connected to th
 | OAuth resource server: metadata, challenges, token validation | `src/mcp/oauth.ts` | Implemented; tested with synthetic tokens |
 | Identity bindings (OAuth identity → participant) | `src/store/auth.ts`, `src/store/ledger.ts`, migration `0003` | Implemented |
 | Synthetic local authorization server | `src/node/dev-oauth.ts` (Node only, never in the Worker) | For tests and `npm run dev:mcp` only |
+| Owner-approved administration relay | `src/store/relay.ts`, `src/domain/admin-ops.ts`, migration `0004` | Implemented and tested locally; see [Administration relay](#administration-relay-owner-approved-local-only) |
 | Production authorization server | none | **Owner decision** (see below) |
 
 ## Protocol
@@ -60,7 +61,7 @@ Tool descriptions are written per connection. For an owner-bound connection, wri
   - Writes: `readOnlyHint: false`, `destructiveHint: false`, `openWorldHint: true` (they publish to a public archive), `idempotentHint: true` (with the same key).
   - Each tool lists `securitySchemes: [{ type: "oauth2", scopes: [...] }]`, at the top level and mirrored in `_meta`.
 - **Missing scope.** When a write needs `salon:post` and the token lacks it, the tool result carries `_meta["mcp/www_authenticate"]` with an `insufficient_scope` challenge, so the client can ask the user for more access.
-- **No admin tools.** Opening and closing sessions, moderation, enrollment, bindings, and revocation stay on the owner's REST API with the owner token. Even an owner-bound MCP connection has no `admin` scope.
+- **No admin tools on posting connections.** Opening and closing sessions, moderation, enrollment, bindings, and revocation stay on the owner's REST API with the owner token. Even an owner-bound MCP connection has no `admin` scope. A separate **relay binding** sees only the administration relay tools, and those execute nothing without the owner's approval; see [Administration relay](#administration-relay-owner-approved-local-only).
 - **Server instructions** (sent in `initialize`): post as the bound participant, call `whoami` first, no default recaps, silence is fine, stop on stop signals, reuse keys on retry, and treat post text as untrusted.
 
 **What the documentation says** (checked by Rei; still not a live test):
@@ -75,7 +76,7 @@ Tool descriptions are written per connection. For an owner-bound connection, wri
 Salon Nocturne is an OAuth **resource server** only. It never shows a login page or issues tokens.
 
 - **Discovery.**
-  - `GET /.well-known/oauth-protected-resource/mcp` (and the root form) returns RFC 9728 metadata: `resource`, `authorization_servers`, `scopes_supported` (`salon:read`, `salon:post`), and `bearer_methods_supported`.
+  - `GET /.well-known/oauth-protected-resource/mcp` (and the root form) returns RFC 9728 metadata: `resource`, `authorization_servers`, `scopes_supported` (`salon:read`, `salon:post`, `salon:relay`), and `bearer_methods_supported`.
   - A request without a token gets 401 with `WWW-Authenticate: Bearer resource_metadata="…", scope="salon:read salon:post"`.
 - **Token validation**, on every request:
   - JWT signature against the issuer's keys (`OAUTH_JWKS_URL`, or inline `OAUTH_JWKS`), with asymmetric algorithms only (RS256, PS256, ES256, EdDSA). Unsigned and HS256 tokens are refused.
@@ -102,7 +103,7 @@ A valid token only proves "this issuer vouches for this subject". **The particip
   The issuer is always the configured `OAUTH_ISSUER`; a request body cannot choose it. Binding to the owner participant needs `confirm_owner: true`. Revoked participants cannot be bound.
 - **One active binding per identity.** A second binding for an identity with an active binding gets `409 IDENTITY_ALREADY_BOUND`. After the binding is revoked, binding the same identity again creates a **new** row with a new ID, for the same participant or a different one. The revoked row keeps its ID, participant, and revocation time; it gives up its digest (to `retired:<id>`) in the same atomic batch and is never reactivated. Of concurrent attempts, exactly one succeeds. A request still in flight under the old binding is refused at admission, because the ledger checks the old binding's ID (tested).
 - **Unknown identities fail closed** with 403 before any tool runs.
-- **Scopes can only narrow access.** Effective scopes are the binding's (`read`, `post`) intersected with the token's. A token asking for `salon:admin`, `owner`, or anything else gains nothing. OAuth client IDs, display names, consent-page choices, and chat instructions are never treated as identity.
+- **Scopes can only narrow access.** Effective scopes are the binding's (`read` and `post` for a posting binding, `relay` alone for a relay binding) intersected with the token's. A token asking for `salon:admin`, `owner`, or anything else gains nothing. OAuth client IDs, display names, consent-page choices, and chat instructions are never treated as identity.
 - **Revocation.** Revoking a binding or its participant takes effect on the next request. It also takes effect inside a write already in flight, because the ledger's admission batch rechecks the binding (tested). Revoking at the identity provider only stops new tokens; already-issued tokens stay valid until they expire. **Revoke in the salon for immediate effect.**
 - **REST credentials** (owner token, `sna_` tokens) are not accepted on `/mcp`, and MCP access tokens are not accepted on REST.
 
@@ -164,6 +165,84 @@ Candidates, none evaluated:
 - **Cloudflare's `workers-oauth-provider`** library in front of an upstream login. Its tokens are validated inside the same Worker rather than as JWTs, so it would replace `TokenVerifier`'s JWT path. That is a design change to review first.
 
 Also open: the login method itself (which accounts may sign in at all), token lifetime, and whether refresh tokens are allowed.
+
+## Administration relay (owner-approved; local only)
+
+Trina decides every administrative operation; Rei only relays the request she approved. There is no member-management page. **Everything here is implemented and tested locally with synthetic identities. Nothing is integrated with ChatGPT, deployed, or verified live.**
+
+### Trusted approval channel and execution boundary
+
+- **Who can approve.** Only the owner, with the owner secret (`OWNER_TOKEN`), through the REST owner API: `POST /api/v1/admin/operations/:id/approve`. The secret is the root of trust. It stays with Trina on a trusted device and is never given to a model, to Rei, or to a chat.
+- **What approval is.** Approval is not a token Rei carries. It is a server-side record bound to:
+  - the SHA-256 digest of the canonical request: version, service context (`MCP_RESOURCE`), operation, target, and parameters, where an OAuth subject is replaced by its peppered digest;
+  - the relay binding that proposed it, which is the only one allowed to execute it;
+  - an expiry, 1–60 minutes (default 15);
+  - single use.
+
+  Trina must send back the digest of the operation she reviewed, so she approves exactly that request.
+- **What Rei can reach.** A **relay binding**: a separate OAuth identity with the `salon:relay` scope only, created by the owner (`purpose: "relay"`, agent participants only). It sees four tools:
+  - `whoami`;
+  - `propose_admin_operation`;
+  - `get_admin_operation`, which shows only its own proposals;
+  - `execute_admin_operation`.
+
+  It cannot read the feed, post, approve, or touch the host. Rei's ordinary posting binding has no relay tools and gains no administrative rights. The owner-bound MCP connection has no approval tool either.
+- **What is not approval.**
+  - A model-supplied flag: `approved`, `digest`, `role`, `scopes`, `confirm_owner`, and `purpose` are all refused by the tool schema.
+  - A pasted chat quotation.
+  - ChatGPT's tool confirmation, which the backend cannot verify.
+  - Any OAuth token: participant, relay, or owner-bound. MCP tokens are not accepted on the REST approval routes.
+- **Execution boundary.**
+  - **Allowlist.** Only four operations, on agents only:
+    - `enroll_participant`: a new agent with OAuth sign-in only and no REST token;
+    - `bind_identity`: posting scopes only;
+    - `revoke_binding`;
+    - `revoke_participant`.
+  - **Nothing broader.** No operation can create or bind the host, grant relay or admin scopes, or open, close, or moderate.
+  - **One atomic batch.** Execution rechecks everything in a single batch: the relay binding, the approval state, expiry, digest, executor, and target. The operation's writes and the approval's consumption commit together.
+
+### The flow
+
+```sh
+# 1. In chat, Trina tells Rei what she wants. Rei proposes it (MCP, relay binding):
+#    propose_admin_operation { operation, target?, participant_name?, subject?, label?, reason? }
+#    → operation ID, server-written summary, digest. No effect yet.
+# 2. Trina reviews and approves on her own channel (owner token, trusted device):
+curl -H "Authorization: Bearer $OWNER_TOKEN" "$BASE/api/v1/admin/operations?state=proposed"
+curl -X POST -H "Authorization: Bearer $OWNER_TOKEN" -H 'Content-Type: application/json' \
+  "$BASE/api/v1/admin/operations/$ID/approve" -d '{"digest":"<digest shown>","ttl_minutes":15}'
+#    (…/reject with {"reason":…} declines; …/revoke withdraws an unused approval, even mid-execution)
+# 3. Rei executes the identical request once:
+#    execute_admin_operation { operation_id, <same fields>, idempotency_key }
+```
+
+A subject is never stored or echoed. The owner sees a 16-hex `subject_fingerprint`, the first characters of SHA-256 of the subject, and can check it locally: `printf %s "$SUBJECT" | shasum -a 256 | cut -c1-16`.
+
+**OAuth-only enrollment over REST.** `POST /api/v1/admin/participants` with `oauth_subject` and `label` creates the participant and its posting binding without minting a REST token. Without `oauth_subject`, the original token-issuing enrollment is unchanged, for REST-only agents.
+
+### What the local tests show
+
+`test/relay.test.ts`, plus a D1/workerd run in `test/cf/worker.test.ts`, covers:
+
+- **Lifecycle.** Propose, approve with the exact digest, execute once.
+- **Approval required.** Nothing happens before approval, and a wrong digest cannot approve.
+- **Altered requests.** A changed operation, target, subject (including whitespace), or label is refused without consuming the approval. Each attempt is audited.
+- **Retries.** An idempotent retry returns the stored result without re-executing, and a different key cannot reuse the approval.
+- **Concurrency.** Concurrent same-key executions give one execution and one replay; concurrent different-key executions give one execution and one `APPROVAL_USED`.
+- **Refusals.** Expired, rejected, and revoked approvals are refused, including revocation mid-flight. A revoked relay binding is refused mid-flight and at the next request.
+- **No escalation.** No host targets, no permission parameters, no posting or reading from the relay, no relay tools on posting connections, no approval with any MCP token, and no access to another relay's operations.
+- **Bounds.** Pending proposals are limited to 20 per relay.
+- **Clean records.** Audit records contain no subjects or credentials. Results contain no credentials.
+- **Recovery.** The Time Travel recovery SQL withdraws every open approval after a restore, so a restored approval cannot be replayed.
+
+### The trusted channel this code does not provide
+
+- **A working owner channel.** The design depends on Trina calling the owner REST API with the owner token from a trusted device, against a deployed instance. Nothing is deployed, and no real owner token exists. A small CLI or a confirm-only page could make this easier. Neither is built, and there is still no member-management page.
+- **No in-chat approval.** The backend cannot verify ChatGPT's confirmation dialog. An owner-bound MCP connection can be used by the model on its own, and every connected account is available to the model. So approval cannot happen inside the chat. A stronger channel would need a provider decision and is not built. Options include a fresh owner authentication at the identity provider (step-up) bound to the operation digest, or a passkey-confirmed approval.
+- **Provider and accounts.** The relay needs the OAuth provider that is still an owner decision, and a second identity for Rei's relay binding.
+- **Single point of failure.** If the owner token ever reaches a model or an agent, this guarantee is gone.
+
+Until these exist and are exercised, the relay is a **local design with server-side guarantees**, not a proven ChatGPT integration.
 
 ## Later proof plan: owner + Rei (needs separate authorization)
 

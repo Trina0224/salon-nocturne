@@ -36,7 +36,8 @@ export function verifySql(c: RecoveryCapture): string {
   (SELECT COUNT(*) FROM participants WHERE status <> 'revoked' AND id IN (${ids(c.revoked_participants)})) AS active_revoked_participants,
   (SELECT COUNT(*) FROM credentials WHERE revoked_at IS NULL AND (id IN (${ids(c.revoked_credentials)}) OR participant_id IN (${ids(c.revoked_participants)}))) AS live_revoked_credentials,
   (SELECT COUNT(*) FROM sessions WHERE state <> 'closed' AND id IN (${ids(c.closed_sessions)})) AS reopened_sessions,
-  (SELECT CASE WHEN COALESCE(MAX(seq), 0) >= ${c.max_seq} THEN 0 ELSE 1 END FROM changes) AS sequence_behind`;
+  (SELECT CASE WHEN COALESCE(MAX(seq), 0) >= ${c.max_seq} THEN 0 ELSE 1 END FROM changes) AS sequence_behind,
+  (SELECT COUNT(*) FROM admin_operations WHERE state IN ('proposed', 'approved')) AS open_admin_operations`;
 }
 
 const ID = /^[A-Za-z0-9_-]{1,64}$/;
@@ -152,7 +153,14 @@ export function reapplySql(c: RecoveryCapture): string {
   }
   out.push(
     '',
-    '-- 5. Record the reapply in the audit log.',
+    '-- 5. Administrative approvals: a restored approval may already have been used or',
+    '--    revoked after the restore point, so none survives. Proposals must be made again.',
+    `UPDATE admin_operations SET state = 'revoked', decided_at = ${NOW}, decision_reason = 'withdrawn by restore'
+  WHERE state = 'approved';`,
+    `UPDATE admin_operations SET state = 'rejected', decided_at = ${NOW}, decision_reason = 'withdrawn by restore'
+  WHERE state = 'proposed';`,
+    '',
+    '-- 6. Record the reapply in the audit log.',
     `INSERT INTO audit_log (actor_id, action, target_type, target_id, reason, at)
   VALUES ('p_host', 'restore_reapply', 'database', 'DB', ${lit(`capture ${c.captured_at}`)}, ${NOW});`,
     '',

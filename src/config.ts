@@ -66,6 +66,7 @@ export interface WorkerEnv {
   OAUTH_JWKS_URL?: string;
   OAUTH_JWKS?: string;
   MCP_ALLOWED_ORIGINS?: string;
+  DRIVE_BRIDGE_CONFIG?: string;
 }
 
 const MCP_VARS = ['MCP_RESOURCE', 'OAUTH_ISSUER', 'OAUTH_AUTHORIZATION_SERVER', 'OAUTH_JWKS_URL', 'OAUTH_JWKS', 'MCP_ALLOWED_ORIGINS'] as const;
@@ -176,6 +177,12 @@ export function workerConfig(env: WorkerEnv): ConfigResult {
   if (mode !== 'on' && mode !== 'off') problems.push('SALON_MAINTENANCE must be "on" or "off".');
 
   const mcp = mcpConfig(env, problems);
+  // The Drive bridge is implemented and tested against mock Drive clients
+  // only. This Worker build has no Drive API client, so configuring the
+  // bridge here fails closed instead of pretending to transport messages.
+  if ((env.DRIVE_BRIDGE_CONFIG ?? '').trim() !== '') {
+    problems.push('DRIVE_BRIDGE_CONFIG is set, but this build has no Drive API client; the bridge runs only with local mock clients.');
+  }
 
   if (problems.length > 0) return { ok: false, problems };
   return { ok: true, config: { ownerTokenHashes: hashes, tokenPepper: pepper, writesPerMinute, exportByteCap, maintenance: mode === 'on', mcp } };

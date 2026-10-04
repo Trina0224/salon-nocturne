@@ -80,7 +80,7 @@ test('restore runbook: reapplied redactions, revocations, and closes hold before
     const before = verifyRow(restored.raw, capture);
     assert.ok(before.unredacted_posts === 1 && before.reopened_sessions === 1 && (before.live_revoked_credentials ?? 0) >= 2);
     restored.raw.exec(reapplySql(capture));
-    assert.deepEqual(Object.values(verifyRow(restored.raw, capture)), [0, 0, 0, 0, 0, 0]);
+    assert.deepEqual(Object.values(verifyRow(restored.raw, capture)), [0, 0, 0, 0, 0, 0, 0]);
     const changes = () => (restored.raw.prepare('SELECT COUNT(*) AS n FROM changes').get() as { n: number }).n;
     const n = changes();
     restored.raw.exec(reapplySql(capture));
@@ -130,7 +130,7 @@ test('restore runbook: change cursors handed out after the restore point do not 
     const restored = setup({ dbPath: r.dbPath, maintenance: true });
     await restored.salon.ready;
     restored.raw.exec(reapplySql(capture));
-    assert.deepEqual(Object.values(verifyRow(restored.raw, capture)), [0, 0, 0, 0, 0, 0]);
+    assert.deepEqual(Object.values(verifyRow(restored.raw, capture)), [0, 0, 0, 0, 0, 0, 0]);
     restored.raw.close();
 
     const open = setup({ dbPath: r.dbPath });

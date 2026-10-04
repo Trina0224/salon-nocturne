@@ -2,7 +2,7 @@
 // storage or HTTP concerns so the same rules can move to another runtime.
 
 export type Role = 'owner' | 'agent';
-export type Scope = 'read' | 'post' | 'admin';
+export type Scope = 'read' | 'post' | 'admin' | 'relay';
 
 /** An authenticated caller, resolved by the server from a credential. */
 export interface Actor {

@@ -9,6 +9,8 @@ import type { Actor, Role, Scope } from '../domain/model.ts';
 
 export const OWNER_PARTICIPANT_ID = 'p_host';
 export const OWNER_CREDENTIAL_ID = 'owner-secret';
+/** Credential IDs of Drive bridge actors; stored credentials are always 'cred_…'. */
+export const DRIVE_CREDENTIAL_PREFIX = 'drive:';
 export const AGENT_SCOPES: Scope[] = ['read', 'post'];
 
 export interface AuthConfig {
@@ -23,8 +25,15 @@ export type Resolution = { kind: 'ok'; actor: Actor } | { kind: 'revoked' } | { 
 /** An OAuth connection resolved through its server-side binding. */
 export type OAuthResolution = { kind: 'ok'; actor: Actor; label: string } | { kind: 'revoked' } | { kind: 'unknown' };
 
-/** Scopes an OAuth binding can ever carry. Admin authority never travels over OAuth. */
+/** Scopes a posting binding carries. Admin authority never travels over OAuth. */
 export const OAUTH_BINDING_SCOPES: Scope[] = ['read', 'post'];
+/**
+ * Scopes a relay binding carries: it can propose administrative operations
+ * and execute ones the owner approved for it, and nothing else. It cannot
+ * read the feed, post, or approve.
+ */
+export const RELAY_BINDING_SCOPES: Scope[] = ['relay'];
+const ANY_OAUTH_SCOPE: Scope[] = ['read', 'post', 'relay'];
 
 export class Authenticator {
   private readonly db: SqlDb;
@@ -108,7 +117,7 @@ export async function resolveOAuthBinding(
   if (!r) return { kind: 'unknown' };
   if (r.revoked_at !== null || r.status !== 'active') return { kind: 'revoked' };
   const stored = JSON.parse(String(r.scopes)) as Scope[];
-  const scopes = OAUTH_BINDING_SCOPES.filter((s) => stored.includes(s) && grantedScopes.includes(s));
+  const scopes = ANY_OAUTH_SCOPE.filter((s) => stored.includes(s) && grantedScopes.includes(s));
   return {
     kind: 'ok',
     label: String(r.label),
@@ -128,6 +137,15 @@ export async function resolveOAuthBinding(
  */
 export function accessStillValidSql(actor: Actor): { sql: string; params: string[] } {
   if (actor.role === 'owner' && actor.credentialId === OWNER_CREDENTIAL_ID) return { sql: '1', params: [] };
+  // Drive bridge actors hold no credential: access is the participant's
+  // enabled outbox mapping plus an active agent participant.
+  if (actor.credentialId.startsWith(DRIVE_CREDENTIAL_PREFIX)) {
+    return {
+      sql: `EXISTS (SELECT 1 FROM drive_participants d JOIN participants p ON p.id = d.participant_id
+              WHERE d.participant_id = ? AND d.enabled = 1 AND p.status = 'active' AND p.role = 'agent')`,
+      params: [actor.participantId],
+    };
+  }
   return {
     sql: `EXISTS (SELECT 1 FROM credentials c JOIN participants p ON p.id = c.participant_id
             WHERE c.id = ? AND p.id = ? AND c.revoked_at IS NULL AND p.status = 'active')`,

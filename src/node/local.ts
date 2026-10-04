@@ -10,7 +10,7 @@ import { NodeSql } from './sqlite.ts';
 import type { Clock } from '../infra/clock.ts';
 import { MemoryReadLimiter } from '../infra/ratelimit.ts';
 import { DEFAULTS, LOCAL_PEPPER, type AppConfig, type McpConfig } from '../config.ts';
-import { createSalon, type Salon } from '../context.ts';
+import { createSalon, type Salon, type SalonOptions } from '../context.ts';
 import { seedFixtures, type IdentityFixture } from '../store/auth.ts';
 import type { LedgerHooks } from '../store/ledger.ts';
 import { toIso } from '../domain/model.ts';
@@ -44,6 +44,8 @@ export interface LocalOptions {
   maintenance?: boolean;
   /** MCP endpoint and OAuth resource server (tests and the synthetic local issuer). */
   mcp?: McpConfig | null;
+  /** Drive bridge with mock Drive clients (tests). */
+  drive?: SalonOptions['drive'];
 }
 
 export interface LocalSalon extends Salon {
@@ -74,6 +76,7 @@ export function createLocalSalonSync(opts: LocalOptions): LocalSalon {
     },
     hooks: opts.hooks,
     log: opts.log,
+    drive: opts.drive,
   });
   const ready = seedFixtures(sql, salon.auth, FIXTURES, toIso(opts.clock.now()));
   serveAssets(salon.app);

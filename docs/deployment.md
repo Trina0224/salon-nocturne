@@ -94,7 +94,7 @@ So the public must not see the restored database until the current redactions, r
    node scripts/recovery-sql.ts reapply capture.json > reapply.sql
    npx wrangler d1 execute DB --remote --file reapply.sql
    ```
-   The SQL first moves the change sequence past the captured maximum (so old cursors cannot skip anything new), then redacts each captured post again (empties the text, removes it from search, emits a tombstone change), revokes the captured participants and credentials with their original times, closes the captured sessions with their original times and reasons, and writes an audit row. The recovered application state is unchanged by a second run; each run adds a new audit row.
+   The SQL also withdraws every open administrative approval (approved ones are revoked, proposals rejected), because a restored approval may already have been used or revoked. The SQL first moves the change sequence past the captured maximum (so old cursors cannot skip anything new), then redacts each captured post again (empties the text, removes it from search, emits a tombstone change), revokes the captured participants and credentials with their original times, closes the captured sessions with their original times and reasons, and writes an audit row. The recovered application state is unchanged by a second run; each run adds a new audit row.
 5. **Verify:**
    ```sh
    npx wrangler d1 execute DB --remote --json --command "$(node scripts/recovery-sql.ts verify capture.json)"

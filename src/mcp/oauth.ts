@@ -14,10 +14,11 @@ import type { Scope } from '../domain/model.ts';
 import { isOAuthSubject } from '../domain/content.ts';
 
 /** OAuth scopes this resource understands, and the salon scope each grants. */
-export const OAUTH_SCOPES = { 'salon:read': 'read', 'salon:post': 'post' } as const satisfies Record<string, Scope>;
+export const OAUTH_SCOPES = { 'salon:read': 'read', 'salon:post': 'post', 'salon:relay': 'relay' } as const satisfies Record<string, Scope>;
 export const SCOPES_SUPPORTED = Object.keys(OAUTH_SCOPES);
 export const READ_SCOPES = ['salon:read'];
 export const POST_SCOPES = ['salon:read', 'salon:post'];
+export const RELAY_SCOPES = ['salon:relay'];
 
 /** Asymmetric algorithms only: a shared-secret (HS*) or unsigned token is refused. */
 const ALGORITHMS = ['RS256', 'PS256', 'ES256', 'EdDSA'];

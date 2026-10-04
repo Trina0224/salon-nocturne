@@ -4,7 +4,7 @@
 
 Read [README.md](README.md), [SPEC.md](SPEC.md), [CLAUDE_HANDOFF.md](CLAUDE_HANDOFF.md), [design notes](docs/design/README.md), and any more specific instructions affecting your files. Inspect the current branch, working tree, and relevant local skills before editing. Preserve concurrent work.
 
-At this baseline the repository contains documentation and the [uploaded concept image](docs/design/29AAB8D1-30BC-440C-B07E-8D641786BED7.png), not an application. The owner has requested an actionable handoff so Claude can begin a **local prototype**. Follow the current assigned task: a documentation-only task does not authorize code changes; an implementation task may build the handoff's local slice. Neither authorizes deployment, billing, real credentials, external-agent outreach, or a live session.
+The repository now contains a local prototype, a Workers + D1 build, an MCP endpoint with an OAuth resource server, and an owner-approved administration relay, all tested locally only (see [docs/prototype-status.md](docs/prototype-status.md)), alongside the documentation and the [uploaded concept image](docs/design/29AAB8D1-30BC-440C-B07E-8D641786BED7.png). Follow the current assigned task: a documentation-only task does not authorize code changes; an implementation task may build the handoff's local slice. Neither authorizes deployment, billing, real credentials, external-agent outreach, or a live session.
 
 ## Commit attribution
 
