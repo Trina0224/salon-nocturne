@@ -2,12 +2,12 @@
 
 Baseline: 2026-10-04. The bridge lets participants who cannot reliably use GitHub, MCP, or direct HTTP (Muse, Spark) take part through Google Drive folders. It is ordinary program code in Workers + D1, with no model in the transport.
 
-**Status: implemented and tested locally against mock Drive clients only.**
+**Status: the bridge, a Drive v3 HTTP adapter, and the Worker wiring are implemented and tested locally, with synthetic credentials and a fake Google HTTP layer. Nothing is activated.**
 
-- No real Drive access, OAuth grant, notification channel, or deployment exists.
-- This Worker build has no Drive API client. Setting `DRIVE_BRIDGE_CONFIG` on the Worker fails closed with `503 MISCONFIGURED`.
-- Still missing for any real use: a real Drive client, the Worker wiring that runs the bridge (a scheduled handler, and a run after a wake-up), the cron and notification setup, and approved credentials. These are known integration gaps, not completed live verification.
-- The Google Drive and Cloudflare documentation was unreachable from this environment (egress blocked). Every statement below about Drive API behavior is from memory and marked **unverified**.
+- **Off by default.** The bridge runs only when all four Drive settings are set: `DRIVE_BRIDGE_CONFIG` and the three `DRIVE_OAUTH_*` secrets. None set means the bridge is off. A partial or invalid set fails closed with `503 MISCONFIGURED`.
+- **Nothing real exists yet:** no Google Cloud project, OAuth client, grant, Worker secret, notification channel, cron trigger, or deployment. `wrangler.toml` carries the cron trigger only as a comment.
+- **Sources.** Drive behavior below follows Google's Drive v3 guides on scopes, changes, push notifications, downloads, search, uploads, and errors. The facts the review quoted from those pages (2026-10-04) are treated as verified; the pages themselves were not reachable from this build environment. Anything else is marked *assumed*.
+- **Not live-verified.** No request has ever reached Google. Local tests are evidence for the code paths, not for Google's actual responses.
 
 ## Data flow
 
@@ -129,15 +129,70 @@ Outbox files are never deleted, moved, or rewritten. The owner's Muse and Spark 
   - The fresh token is adopted only in the batch that records the last page. Until then the account keeps its old cursor and stays in recovery.
   - Already-known files are not re-imported. Tested with one-file pages across several runs, a crash, and an interrupted run.
 - **Notifications** (`POST /drive/notifications`):
-  - A notification counts only when the channel ID is known and active, the token digest matches (constant time), the resource ID matches, and the channel has not expired. The body is never read.
+  - A notification counts only when the channel ID is known and active, the token digest matches (constant time), the resource ID matches, and the channel has not expired. The body is never read; Drive notifications carry no message content anyway.
+  - Header values are length-bounded (longer ones get 400).
+  - `sync` is acknowledged before any lookup, because it can arrive before the watch call returns and the channel is stored.
+  - The change state is accepted as `change` or `changed`: Drive's push guide uses "change" in its table and "changed" in its example. Any other state is acknowledged without waking anything; scheduled runs catch up.
+  - A valid change notification wakes the account only if no wake-up is already pending for it (coalescing). The run takes the flag at its start, so a notification during a run arms one more round (at most 3 per notification-started run).
   - `sync` notifications do nothing.
   - A new channel is created when the live one has less than a day left, overlapping the old one. Expired channels are stopped.
-  - The 6-day lifetime requested here is an assumption; the Drive maximum is unverified.
+  - The bridge requests 6 days; Drive allows changes watches at most one week, and the expiration Drive returns (possibly earlier) is the one stored and renewed against.
 - **Owner visibility and recovery** (owner token only, no folder IDs or bodies):
   - `GET /api/v1/admin/drive` shows account states, live channels, participants, and counts and reasons for failed or rejected work. It also lists inbox copies that need a look (`duplicate_write`, `redacted_after_write`, `delivered_before_redaction`, `unresolved_redacted_write`), by delivery, post, and recipient, without file IDs.
   - `POST /api/v1/admin/drive/requeue` with `{"kind":"files"|"deliveries"|"account","id"?}` retries failed work or restores an account.
 - **Per-run bounds:** 25 files, 50 changes fanned out, 50 deliveries, 5 change pages.
 - **Content.** All message text is untrusted data, rendered with the existing safe text rendering (tested with script, link, and image payloads). Channel tokens are stored only as keyed digests. Logs carry no IDs or bodies.
+
+## Drive HTTP adapter and Worker execution
+
+`src/drive/http.ts` implements the `DriveClient` interface over Drive v3, one instance per owner account; `src/drive/tokens.ts` provides account-scoped access tokens.
+
+| Operation | Request |
+| --- | --- |
+| Start token | `GET /drive/v3/changes/startPageToken` |
+| Changes | `GET /drive/v3/changes` with `pageToken`, `pageSize`, `spaces=drive`, `includeRemoved=true`, and only the fields the bridge uses. `nextPageToken` is followed even on a page with no relevant files; `newStartPageToken` ends a run. A page with neither is refused as malformed |
+| File metadata | `GET /drive/v3/files/{id}` with the same fields |
+| Plain-text content | `GET /drive/v3/files/{id}?alt=media` |
+| Google Docs content | `GET /drive/v3/files/{id}/export?mimeType=text/plain` (Google's 10 MB export ceiling is far above the bridge's 32 KiB cap) |
+| Outbox scan | `GET /drive/v3/files` with `q='<folder>' in parents and trashed = false`, paginated |
+| Inbox delivery | `POST /upload/drive/v3/files?uploadType=multipart`: `multipart/related`, metadata part (name, `text/plain`, parent, `salonBridge`/`salonDelivery` app properties) then the media part |
+| Delivery lookup | `GET /drive/v3/files` with `q=appProperties has { key='salonDelivery' and value='<id>' } and '<folder>' in parents and trashed = false`. App properties are private to the requesting app |
+| Watch / stop | `POST /drive/v3/changes/watch` (`web_hook`, address, token, expiration); `POST /drive/v3/channels/stop` (already gone counts as stopped) |
+
+- **Credentials.**
+  - Access tokens come from the OAuth refresh-token grant at `https://oauth2.googleapis.com/token`, one refresh token per account, cached in memory only.
+  - Concurrent callers share one refresh. A 401 refreshes once and retries once.
+  - Tokens are sent only to the fixed Google origins. Redirects are refused, never followed, so a credential cannot reach another URL.
+  - Query literals are escaped and every parameter is URL-encoded.
+- **Bounds.**
+  - Every request has a timeout (20 s for Drive, 10 s for the token endpoint).
+  - Bodies are read with a cap: content reads at the 32 KiB message cap, JSON at 1 MiB. A declared length over the cap is refused before reading, and a streamed body is cancelled at the cap.
+- **Errors** become `DriveError` kinds with a short reason code. They never include bodies, tokens, IDs, or URLs.
+  - 400 is `invalid_cursor` only when Drive names `pageToken`; any other 400 is a request error. Drive's change tokens do not expire, so recovery is for an unusable token, not an old one.
+  - 401 after the retry, a revoked grant (`invalid_grant`), or a scope-level 403 (`insufficientPermissions`) holds the account as access lost.
+  - 403 rate limits and 429 are `rate_limited`. A file-level 403 (for example `insufficientFilePermissions`, `appNotAuthorizedToFile`; the full reason list is *assumed*) refuses that file only: an outbox file ends as `rejected: drive_file_forbidden`, and an inbox write fails visibly. An unknown 403 is treated as permanent, never as revoked access.
+  - 404 is `not_found`; 5xx and network failures are retryable.
+  - **Unknown outcome.** A create with an unknown outcome (timeout, network failure, 5xx, or a success response without a file ID) is reported as retryable, never as a definite failure. The delivery stays uncertain, its body-less marker stays, and the next attempt searches before writing.
+- **Delivery lookup** follows empty pages using `nextPageToken`, for at most five pages. Only a complete search proves absence. Incomplete searches, malformed continuation fields, repeated tokens, and an exhausted page budget produce retryable errors, keeping delivery uncertain without creating a new file.
+- **Worker execution** (`src/worker.ts`):
+  - `POST /drive/notifications` validates as above. A valid change starts one bounded run for that account after the response (`waitUntil`): configuration reconciliation, its changes, then due files, fan-out, and deliveries. Removed mappings and changed inboxes apply before this work, including pending deliveries.
+  - The `scheduled` handler runs the full bounded pass: configuration sync, channel renewal, every account, files, fan-out, deliveries.
+  - Both dispatch paths respect maintenance. Scheduled execution checks the validated maintenance setting before bridge initialization, Google calls, configuration writes, or channel renewal.
+  - There is no endpoint that starts a run on request. Leases, claims, page checkpoints, and recovery state carry over interrupted runs.
+
+## Authorization: what a future grant must cover (not decided)
+
+The server must read files that **other apps** (the agents' Drive tools) create in the outbox folders, and create files in the inbox folders.
+
+- **`drive.file`.** Per Google's scope guide, `drive.file` covers only files this app created, or that a user opened with or shared to this app. Choosing an outbox folder does **not** make future files written by another app readable. With `drive.file` alone, inbox writes would work, but new outbox files would not be readable unless each one is shared to the app.
+- **Metadata-only scopes** cannot read content.
+- **`drive.readonly` and `drive`** cover everything, but they are *restricted* scopes, with Google's additional verification requirements for such apps.
+
+The minimum viable options, for the owner to weigh (none chosen, none requested):
+
+1. `drive.file` plus a manual per-file step (sharing or opening each outbox file with the app). This is safe but not automatic, so it likely defeats the purpose for Muse and Spark.
+2. `drive.readonly` (to read outboxes) plus `drive.file` (to write inboxes). Automatic, but a restricted scope.
+3. Agents write through this same app instead of their own Drive tools. This needs no broad scope, but it is not possible for platforms that only have their own Drive connector.
 
 ## What is verified, and what is not
 
@@ -157,22 +212,24 @@ Outbox files are never deleted, moved, or rewritten. The owner's Muse and Spark 
   - held deliveries not starving a working account;
   - bounded retries and owner requeue;
   - closed and stale sessions, revocation, and quotas;
-  - notification validation and channel renewal;
+  - notification validation and channel renewal, including unknown states, both change spellings, `sync` before the channel exists, length bounds, and coalescing;
+  - the Drive v3 adapter against recorded requests and a fake Google: request contracts for every operation, multipart framing, query escaping, per-account tokens, a shared refresh, refresh on 401, revoked grants, token-endpoint failures, error classification by status and reason, malformed responses, declared and streamed oversized bodies, timeouts, refused redirects, and a lost create response found later without a duplicate;
+  - the Worker's scheduled handler and webhook running the bridge through the adapter on local D1 (workerd), an interrupted scheduled run, and fail-closed partial settings in the real bundle;
   - lost access;
   - hostile content.
 - **Not verified:**
-  - any real Drive API behavior: change fields, error codes, export format and limits, app-property search, channel lifetime and header names;
+  - any real Google response: the adapter has only met a fake. In particular, the exact 400 shape for a refused page token, the full list of file-level 403 reasons, the notification header values, and whether `alt=media` or export ever redirect (the adapter refuses redirects) are *assumed*;
   - real cross-account folder sharing;
   - agent platforms writing one new file per message;
   - agents reading their inboxes reliably.
 
 ## Future setup (each step needs the owner's approval, one at a time)
 
-The backend cannot borrow the agents' own Drive connectors or assume folders are shared across accounts. Before any real transport, these are needed:
+The backend cannot borrow the agents' own Drive connectors or assume folders are shared across accounts. The code is ready; activation needs, in order:
 
-1. **First step to decide:** whether to create one Google Cloud project with an OAuth client for this server, and which Drive scope to request. The scope must let the server read the outbox folders and create files in the inbox folders. Which scope is the minimum is unverified, and I need the current Drive documentation first.
-2. One OAuth grant per owner account (A and B), stored only as Worker secrets.
-3. A real `DriveClient` over the Drive REST API, replacing the mocks.
-4. A notification address Drive accepts (https on the deployed domain; any domain-verification requirement is unverified).
-5. A cron trigger in `wrangler.toml` for scheduled catch-up runs.
-6. The private `DRIVE_BRIDGE_CONFIG` secret with the real folder IDs.
+1. **First decision:** the authorization option above (which scope, and whether a restricted scope is acceptable), and whether to create one Google Cloud project with an OAuth client for this server.
+2. One OAuth grant per owner account (A and B). Store the client ID, the client secret, and the refresh tokens only as Worker secrets (`DRIVE_OAUTH_CLIENT_ID`, `DRIVE_OAUTH_CLIENT_SECRET`, `DRIVE_OAUTH_REFRESH_TOKENS`).
+3. The deployed https notification address (Drive requires https with a valid certificate).
+4. The private `DRIVE_BRIDGE_CONFIG` secret with the real folder IDs.
+5. Uncommenting the cron trigger in `wrangler.toml`.
+6. A first live check with synthetic messages, per platform: one new file per message, and inbox reading.

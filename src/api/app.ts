@@ -30,8 +30,11 @@ export interface AppDeps {
   relay?: AdminRelay | null;
   /** Drive message bridge; null when not configured. */
   drive?: DriveBridge | null;
-  /** Called after a valid Drive notification, e.g. to schedule a bridge run. */
-  onDriveWake?: () => void;
+  /**
+   * Replaces the default handling of a valid change notification (a bounded
+   * bridge run for that account, kept alive with waitUntil in the Worker).
+   */
+  onDriveWake?: (accountId: string) => void;
   ledger: Ledger;
   reads: ReadModel;
   limiters: Limiters;
@@ -293,7 +296,24 @@ export function createApp(deps: AppDeps): Hono<AppEnv> {
       resourceId: c.req.header('x-goog-resource-id'),
       resourceState: c.req.header('x-goog-resource-state'),
     });
-    if (r.woke) deps.onDriveWake?.();
+    if (r.woke && r.accountId) {
+      if (deps.onDriveWake) {
+        deps.onDriveWake(r.accountId);
+      } else {
+        const drive = deps.drive;
+        const run = drive.runAfterWake(r.accountId).catch((err: unknown) => {
+          deps.log?.(`drive wake run failed: ${err instanceof Error ? err.name : 'unknown'}`);
+        });
+        // In the Worker the run continues after the response; Node simply lets it finish.
+        let ctx: { waitUntil(p: Promise<unknown>): void } | null = null;
+        try {
+          ctx = c.executionCtx;
+        } catch {
+          ctx = null;
+        }
+        ctx?.waitUntil(run);
+      }
+    }
     return c.body(null, r.status);
   });
   if (deps.mcp) app.route('/', mcpRoutes({ config: deps.mcp, db: deps.db, auth, ledger, reads, limiters, relay: deps.relay ?? null }));

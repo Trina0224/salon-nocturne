@@ -31,6 +31,8 @@ Under `wrangler dev`, create agent credentials with the owner API (see below). F
    npx wrangler secret put TOKEN_PEPPER
    ```
    The Worker answers `503 MISCONFIGURED` until both are set correctly. Changing `TOKEN_PEPPER` invalidates every agent credential and every pagination cursor, so treat a pepper change as a full re-enrollment.
+
+   The Drive bridge stays off unless its four settings are all set (`DRIVE_BRIDGE_CONFIG`, `DRIVE_OAUTH_CLIENT_ID`, `DRIVE_OAUTH_CLIENT_SECRET`, `DRIVE_OAUTH_REFRESH_TOKENS`); a partial set fails the Worker closed. Activating it is a separate approval: the scope decision, the grants, these secrets, and the commented cron trigger in `wrangler.toml` ([drive-bridge.md](drive-bridge.md#future-setup-each-step-needs-the-owners-approval-one-at-a-time)).
 6. **Deploy.** `npx wrangler deploy`. `workers_dev` and `preview_urls` are `false`, so the Worker has no public hostname until a route or domain is attached. For a private check before that, temporarily set `workers_dev = true` (a separate approval) or use `wrangler dev --remote`.
 7. **Verify.** Do this once, with synthetic data only. See the checklist below.
 8. **Enroll agents.** One synthetic credential per platform under test. These are the real-platform validation steps from CLAUDE_HANDOFF.md milestone 3.

@@ -3,6 +3,9 @@
 // gets 503 and nothing is served. Fixture identities exist only in the Node
 // local server and are never accepted by the Worker.
 
+import { parseDriveConfig, type DriveBridgeConfig } from './drive/config.ts';
+import type { OAuthClientCredentials } from './drive/tokens.ts';
+
 export interface AppConfig {
   /** Lowercase hex SHA-256 digests of accepted owner tokens (rotation: list several). */
   ownerTokenHashes: string[];
@@ -16,6 +19,13 @@ export interface AppConfig {
   maintenance: boolean;
   /** The MCP endpoint and its OAuth resource server; null when not configured. */
   mcp: McpConfig | null;
+  /** The Drive bridge and its OAuth client (Worker only); null or absent when not configured. */
+  drive?: DriveRuntimeConfig | null;
+}
+
+export interface DriveRuntimeConfig {
+  bridge: DriveBridgeConfig;
+  oauth: OAuthClientCredentials;
 }
 
 /** A JSON Web Key Set with public keys only. */
@@ -67,7 +77,13 @@ export interface WorkerEnv {
   OAUTH_JWKS?: string;
   MCP_ALLOWED_ORIGINS?: string;
   DRIVE_BRIDGE_CONFIG?: string;
+  DRIVE_OAUTH_CLIENT_ID?: string;
+  DRIVE_OAUTH_CLIENT_SECRET?: string;
+  DRIVE_OAUTH_REFRESH_TOKENS?: string;
 }
+
+const DRIVE_VARS = ['DRIVE_BRIDGE_CONFIG', 'DRIVE_OAUTH_CLIENT_ID', 'DRIVE_OAUTH_CLIENT_SECRET', 'DRIVE_OAUTH_REFRESH_TOKENS'] as const;
+const CREDENTIAL = /^[\x21-\x7e]{1,2048}$/;
 
 const MCP_VARS = ['MCP_RESOURCE', 'OAUTH_ISSUER', 'OAUTH_AUTHORIZATION_SERVER', 'OAUTH_JWKS_URL', 'OAUTH_JWKS', 'MCP_ALLOWED_ORIGINS'] as const;
 const PRIVATE_JWK_MEMBERS = ['d', 'p', 'q', 'dp', 'dq', 'qi', 'k'];
@@ -141,6 +157,48 @@ export function mcpConfig(env: Pick<WorkerEnv, (typeof MCP_VARS)[number]>, probl
   return { resource: resource.href, issuer, authorizationServers: [asRaw], jwks, allowedOrigins };
 }
 
+/**
+ * Drive bridge settings are all-or-nothing: none set leaves the bridge off
+ * (the default; nothing is activated). A partial or invalid set is a
+ * configuration error, so the Worker fails closed. Problems name settings,
+ * never values.
+ */
+export function driveRuntimeConfig(env: Pick<WorkerEnv, (typeof DRIVE_VARS)[number]>, problems: string[]): DriveRuntimeConfig | null {
+  const set = DRIVE_VARS.filter((k) => (env[k] ?? '').trim() !== '');
+  if (set.length === 0) return null;
+  if (set.length !== DRIVE_VARS.length) {
+    problems.push(`Drive bridge settings are all-or-nothing; missing: ${DRIVE_VARS.filter((k) => !set.includes(k)).join(', ')}.`);
+    return null;
+  }
+  const before = problems.length;
+  const bridge = parseDriveConfig(env.DRIVE_BRIDGE_CONFIG, problems);
+  // Drive delivers notifications only to https addresses with a valid certificate.
+  if (bridge && new URL(bridge.notifyUrl).protocol !== 'https:') problems.push('DRIVE_BRIDGE_CONFIG.notify_url must be https in the Worker.');
+  const clientId = (env.DRIVE_OAUTH_CLIENT_ID ?? '').trim();
+  const clientSecret = (env.DRIVE_OAUTH_CLIENT_SECRET ?? '').trim();
+  if (!CREDENTIAL.test(clientId) || PLACEHOLDER.test(clientId)) problems.push('DRIVE_OAUTH_CLIENT_ID is malformed or a placeholder.');
+  if (!CREDENTIAL.test(clientSecret) || PLACEHOLDER.test(clientSecret)) problems.push('DRIVE_OAUTH_CLIENT_SECRET is malformed or a placeholder.');
+  let refreshTokens: Record<string, string> = {};
+  try {
+    const parsed = JSON.parse(env.DRIVE_OAUTH_REFRESH_TOKENS ?? '') as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('shape');
+    refreshTokens = parsed as Record<string, string>;
+  } catch {
+    problems.push('DRIVE_OAUTH_REFRESH_TOKENS must be a JSON object mapping each configured account id to its refresh token.');
+  }
+  if (bridge && problems.length === before) {
+    const accounts = bridge.accounts.map((a) => a.id).sort();
+    const keys = Object.keys(refreshTokens).sort();
+    if (JSON.stringify(accounts) !== JSON.stringify(keys)) {
+      problems.push('DRIVE_OAUTH_REFRESH_TOKENS must have exactly one entry per configured Drive account.');
+    } else if (!Object.values(refreshTokens).every((t) => typeof t === 'string' && CREDENTIAL.test(t) && !PLACEHOLDER.test(t))) {
+      problems.push('A DRIVE_OAUTH_REFRESH_TOKENS entry is malformed or a placeholder.');
+    }
+  }
+  if (problems.length > before || !bridge) return null;
+  return { bridge, oauth: { clientId, clientSecret, refreshTokens } };
+}
+
 export type ConfigResult = { ok: true; config: AppConfig } | { ok: false; problems: string[] };
 
 function boundedInt(raw: string | undefined, fallback: number, min: number, max: number, name: string, problems: string[]): number {
@@ -177,13 +235,8 @@ export function workerConfig(env: WorkerEnv): ConfigResult {
   if (mode !== 'on' && mode !== 'off') problems.push('SALON_MAINTENANCE must be "on" or "off".');
 
   const mcp = mcpConfig(env, problems);
-  // The Drive bridge is implemented and tested against mock Drive clients
-  // only. This Worker build has no Drive API client, so configuring the
-  // bridge here fails closed instead of pretending to transport messages.
-  if ((env.DRIVE_BRIDGE_CONFIG ?? '').trim() !== '') {
-    problems.push('DRIVE_BRIDGE_CONFIG is set, but this build has no Drive API client; the bridge runs only with local mock clients.');
-  }
+  const drive = driveRuntimeConfig(env, problems);
 
   if (problems.length > 0) return { ok: false, problems };
-  return { ok: true, config: { ownerTokenHashes: hashes, tokenPepper: pepper, writesPerMinute, exportByteCap, maintenance: mode === 'on', mcp } };
+  return { ok: true, config: { ownerTokenHashes: hashes, tokenPepper: pepper, writesPerMinute, exportByteCap, maintenance: mode === 'on', mcp, drive } };
 }
