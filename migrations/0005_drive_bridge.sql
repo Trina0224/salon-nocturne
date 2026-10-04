@@ -28,7 +28,14 @@ CREATE TABLE drive_accounts (
   wake_requested_at TEXT,
   lease_owner TEXT,
   lease_until TEXT,
-  last_run_at TEXT
+  last_run_at TEXT,
+  -- Invalid-cursor recovery in progress: the fresh change token to adopt
+  -- once every outbox has been scanned, and the scan position (folder and
+  -- page within it). The fresh token is adopted only in the batch that
+  -- records the last page.
+  recovery_token TEXT,
+  recovery_folder TEXT,
+  recovery_page TEXT
 );
 
 -- Notification channels (changes.watch). Only a digest of each channel token
@@ -45,6 +52,8 @@ CREATE TABLE drive_channels (
 
 -- One row per outbox file ever seen. A file is processed once; later edits
 -- or appends to it are counted and ignored, never re-imported.
+-- pinned_request is the parsed message and resolved target, stored before
+-- the ledger is called; retries replay it instead of rereading the file.
 CREATE TABLE drive_files (
   file_id TEXT PRIMARY KEY,
   account_id TEXT NOT NULL,
@@ -53,6 +62,7 @@ CREATE TABLE drive_files (
   reason TEXT,
   message_id TEXT,
   post_id TEXT,
+  pinned_request TEXT,
   attempts INTEGER NOT NULL DEFAULT 0,
   next_attempt_at TEXT NOT NULL,
   later_changes INTEGER NOT NULL DEFAULT 0,
@@ -62,7 +72,8 @@ CREATE TABLE drive_files (
 CREATE INDEX drive_files_due ON drive_files(state, next_attempt_at);
 
 -- Message IDs are unique per participant; the body digest detects a reused
--- ID with a changed body.
+-- ID with a changed body. The row is reserved (post_id NULL) when a file
+-- pins its request, and gets its post when the file is accepted.
 CREATE TABLE drive_messages (
   participant_id TEXT NOT NULL REFERENCES participants(id),
   message_id TEXT NOT NULL,
@@ -89,6 +100,17 @@ CREATE TABLE drive_deliveries (
   UNIQUE (post_id, recipient_id)
 );
 CREATE INDEX drive_deliveries_due ON drive_deliveries(state, next_attempt_at);
+
+-- Every inbox file the bridge created, per delivery. More than one row for
+-- a delivery is a duplicate write (e.g. a stalled create that finished after
+-- another worker took over); it is recorded and shown to the owner.
+CREATE TABLE drive_delivery_writes (
+  delivery_id TEXT NOT NULL REFERENCES drive_deliveries(id),
+  remote_file_id TEXT NOT NULL,
+  attempt INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (delivery_id, remote_file_id)
+);
 
 -- Small key/value state, e.g. the change sequence fan-out has reached.
 CREATE TABLE drive_state (

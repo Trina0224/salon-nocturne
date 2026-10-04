@@ -7,15 +7,19 @@
 // - A page of changes is recorded as pending file jobs, and the account's
 //   cursor advances, in one D1 batch. A crash before the batch re-reads the
 //   page; after it, nothing is lost. Recording is idempotent per file ID.
-// - A file job posts through the ledger with an idempotency key derived from
-//   the message ID, so a crash after posting but before marking the job done
-//   replays the same post instead of posting twice.
+// - A file job pins its parsed request before calling the ledger, and posts
+//   with an idempotency key derived from the message ID. A crash after
+//   posting replays the pinned request (never a reread, possibly edited,
+//   source), so it returns the original receipt instead of posting twice.
 // - Fan-out to recipients advances its own cursor in the same batch that
 //   creates the delivery rows.
 // - A delivery that may have been written (timeout, 5xx) is marked
 //   'uncertain'; every retry first looks for the file carrying its delivery
-//   ID before writing. This avoids silent duplicates when Drive's search is
-//   current. It is not exactly-once: Drive offers no conditional create.
+//   ID before writing. That avoids most duplicates, but it is not
+//   exactly-once: Drive offers no conditional create, search may lag, and a
+//   create still in flight when its claim expires can land after another
+//   worker's write. Every created file is logged, so such duplicates are
+//   visible to the owner rather than silent.
 //
 // Webhooks only wake the bridge. Their content is never message data.
 
@@ -59,6 +63,11 @@ export interface BridgeHooks {
   /** Test hook: runs after the ledger accepted a message and before the file job is marked done. */
   afterPost?: (fileId: string) => void | Promise<void>;
 }
+
+/** The exact ledger request a file job replays on every retry once pinned. */
+type PinnedRequest =
+  | { kind: 'thread'; messageId: string; sessionId: string; generation: number; title: string; tags: string[]; body: string }
+  | { kind: 'post'; messageId: string; threadId: string; raw: Record<string, unknown> };
 
 const iso = (ms: number) => new Date(ms).toISOString();
 
@@ -201,32 +210,38 @@ export class DriveBridge {
     const client = this.client(accountId);
     let recorded = 0;
     try {
-      const acct = (await this.db.first('SELECT page_token FROM drive_accounts WHERE id = ?', accountId))!;
-      let token: string = acct.page_token ? String(acct.page_token) : '';
-      if (!token) {
-        token = await client.getStartPageToken();
-        await this.db.run('UPDATE drive_accounts SET page_token = ? WHERE id = ? AND lease_owner = ?', token, accountId, workerId);
-      }
+      const acct = (await this.db.first('SELECT page_token, recovery_token FROM drive_accounts WHERE id = ?', accountId))!;
       const outboxes = await this.outboxes(accountId);
-      for (let page = 0; page < LIMITS.pagesPerRun; page++) {
-        let result;
-        try {
-          result = await client.listChanges(token, LIMITS.changesPerPage);
-        } catch (err) {
-          if (err instanceof DriveError && err.kind === 'invalid_cursor') {
-            recorded += await this.recoverCursor(accountId, workerId, client, outboxes);
-            break;
-          }
-          throw err;
+      if (acct.recovery_token) {
+        // An earlier run started recovering from an invalid cursor: finish that first.
+        recorded += await this.continueRecovery(accountId, workerId, client, outboxes, LIMITS.pagesPerRun);
+      } else {
+        let token: string = acct.page_token ? String(acct.page_token) : '';
+        if (!token) {
+          token = await client.getStartPageToken();
+          await this.db.run('UPDATE drive_accounts SET page_token = ? WHERE id = ? AND lease_owner = ?', token, accountId, workerId);
         }
-        const files = result.changes.filter((c) => !c.removed && c.file).map((c) => c.file!);
-        const next: string = result.nextPageToken ?? result.newStartPageToken ?? token;
-        await this.hooks.beforeCheckpoint?.(accountId);
-        recorded += await this.checkpoint(accountId, workerId, files, outboxes, next);
-        token = next;
-        if (!result.nextPageToken) break;
+        for (let page = 0; page < LIMITS.pagesPerRun; page++) {
+          let result;
+          try {
+            result = await client.listChanges(token, LIMITS.changesPerPage);
+          } catch (err) {
+            if (err instanceof DriveError && err.kind === 'invalid_cursor') {
+              recorded += await this.startRecovery(accountId, workerId, client, outboxes, LIMITS.pagesPerRun - page);
+              break;
+            }
+            throw err;
+          }
+          const files = result.changes.filter((c) => !c.removed && c.file).map((c) => c.file!);
+          const next: string = result.nextPageToken ?? result.newStartPageToken ?? token;
+          await this.hooks.beforeCheckpoint?.(accountId);
+          recorded += await this.checkpoint(accountId, files, outboxes,
+            stmt(`UPDATE drive_accounts SET page_token = ? WHERE id = ? AND lease_owner = ?`, next, accountId, workerId));
+          token = next;
+          if (!result.nextPageToken) break;
+        }
       }
-      await this.db.run(`UPDATE drive_accounts SET wake_requested_at = NULL, last_run_at = ?, last_error = NULL WHERE id = ?`, this.now(), accountId);
+      await this.db.run(`UPDATE drive_accounts SET wake_requested_at = NULL, last_run_at = ?, last_error = CASE WHEN recovery_token IS NULL THEN NULL ELSE 'cursor_reset' END WHERE id = ?`, this.now(), accountId);
     } catch (err) {
       await this.accountError(accountId, err);
     } finally {
@@ -260,8 +275,12 @@ export class DriveBridge {
     return folder ? outboxes.get(folder)! : null;
   }
 
-  /** Records a page's eligible files and advances the cursor, atomically. */
-  private async checkpoint(accountId: string, workerId: string, files: DriveFile[], outboxes: Map<string, string>, nextToken: string): Promise<number> {
+  /**
+   * Records a page's eligible files and moves the cursor (`cursor`, which is
+   * guarded by the lease), atomically. A worker that lost its lease moves
+   * nothing; recording is idempotent, so its files are harmless.
+   */
+  private async checkpoint(accountId: string, files: DriveFile[], outboxes: Map<string, string>, cursor: Statement): Promise<number> {
     const now = this.now();
     const statements: Statement[] = [];
     let n = 0;
@@ -269,39 +288,81 @@ export class DriveBridge {
       const participantId = this.eligible(f, outboxes);
       if (!participantId) continue;
       n++;
-      // A file already processed is never re-imported: later edits or appends are counted only.
+      // A file already processed, or whose request is pinned, is never re-imported: later edits or appends are counted only.
       statements.push(stmt(
         `INSERT INTO drive_files (file_id, account_id, participant_id, state, next_attempt_at, first_seen_at, updated_at)
          VALUES (?, ?, ?, 'pending', ?, ?, ?)
          ON CONFLICT(file_id) DO UPDATE SET later_changes = later_changes + 1, updated_at = excluded.updated_at
-         WHERE drive_files.state <> 'pending'`,
+         WHERE drive_files.state <> 'pending' OR drive_files.pinned_request IS NOT NULL`,
         f.id, accountId, participantId, now, now, now));
     }
-    // The lease condition makes a checkpoint from a worker that lost its lease fail instead of moving the cursor.
-    statements.push(stmt(`UPDATE drive_accounts SET page_token = ? WHERE id = ? AND lease_owner = ?`, nextToken, accountId, workerId));
+    statements.push(cursor);
     await this.db.batch(statements);
     return n;
   }
 
   /**
-   * An unusable cursor: take a fresh start token and scan every configured
-   * outbox of the account, so files changed during the gap are not missed.
-   * Already-known files are ignored by the same idempotent recording.
+   * An unusable cursor: take a fresh start token *first* (so changes during
+   * the scan are seen afterwards), then scan every configured outbox. The
+   * scan is resumable and bounded per run; the fresh token is adopted only
+   * when the last outbox page has been durably recorded.
    */
-  private async recoverCursor(accountId: string, workerId: string, client: DriveClient, outboxes: Map<string, string>): Promise<number> {
+  private async startRecovery(accountId: string, workerId: string, client: DriveClient, outboxes: Map<string, string>, budget: number): Promise<number> {
     const fresh = await client.getStartPageToken();
-    const files: DriveFile[] = [];
-    for (const folder of outboxes.keys()) {
-      let pageToken: string | undefined;
-      for (let page = 0; page < LIMITS.pagesPerRun; page++) {
-        const r = await client.listFolder(folder, pageToken);
-        files.push(...r.files);
-        if (!r.nextPageToken) break;
-        pageToken = r.nextPageToken;
-      }
+    const started = await this.db.run(
+      `UPDATE drive_accounts SET recovery_token = ?, recovery_folder = NULL, recovery_page = NULL, last_error = 'cursor_reset'
+       WHERE id = ? AND lease_owner = ? AND recovery_token IS NULL`, fresh, accountId, workerId);
+    if (started.changes !== 1) return 0;
+    return this.continueRecovery(accountId, workerId, client, outboxes, budget);
+  }
+
+  /** Scans up to `budget` outbox pages from the saved position, checkpointing each. */
+  private async continueRecovery(accountId: string, workerId: string, client: DriveClient, outboxes: Map<string, string>, budget: number): Promise<number> {
+    const folders = [...outboxes.keys()].sort();
+    const st = (await this.db.first('SELECT recovery_folder, recovery_page FROM drive_accounts WHERE id = ?', accountId))!;
+    let folder: string | undefined = st.recovery_folder === null ? folders[0] : String(st.recovery_folder);
+    let page: string | undefined = st.recovery_page === null ? undefined : String(st.recovery_page);
+    // A folder that left the configuration mid-scan: continue with the next one.
+    if (folder !== undefined && !outboxes.has(folder)) {
+      const prev: string = folder;
+      folder = folders.find((f) => f > prev);
+      page = undefined;
     }
-    await this.db.run(`UPDATE drive_accounts SET last_error = 'cursor_reset' WHERE id = ?`, accountId);
-    return this.checkpoint(accountId, workerId, files, outboxes, fresh);
+    let recorded = 0;
+    for (let n = 0; n <= budget; n++) {
+      if (folder === undefined) {
+        // Every outbox page is recorded: adopt the fresh change token.
+        await this.db.run(
+          `UPDATE drive_accounts SET page_token = recovery_token, recovery_token = NULL, recovery_folder = NULL, recovery_page = NULL
+           WHERE id = ? AND lease_owner = ?`, accountId, workerId);
+        return recorded;
+      }
+      if (n === budget) break;
+      let r: { files: DriveFile[]; nextPageToken?: string };
+      try {
+        r = await client.listFolder(folder, page);
+      } catch (err) {
+        // A folder that no longer exists has nothing to recover; move on rather than stall.
+        if (!(err instanceof DriveError && err.kind === 'not_found')) throw err;
+        r = { files: [] };
+      }
+      let nextFolder: string | undefined = folder;
+      let nextPage = r.nextPageToken;
+      if (!nextPage) {
+        const cur: string = folder;
+        nextFolder = folders.find((f) => f > cur);
+      }
+      await this.hooks.beforeCheckpoint?.(accountId);
+      recorded += await this.checkpoint(accountId, r.files, outboxes, nextFolder === undefined
+        ? stmt(`UPDATE drive_accounts SET page_token = recovery_token, recovery_token = NULL, recovery_folder = NULL, recovery_page = NULL
+                WHERE id = ? AND lease_owner = ? AND recovery_token IS NOT NULL`, accountId, workerId)
+        : stmt(`UPDATE drive_accounts SET recovery_folder = ?, recovery_page = ? WHERE id = ? AND lease_owner = ? AND recovery_token IS NOT NULL`,
+          nextFolder, nextPage ?? null, accountId, workerId));
+      if (nextFolder === undefined) return recorded;
+      folder = nextFolder;
+      page = nextPage;
+    }
+    return recorded;
   }
 
   private async accountError(accountId: string, err: unknown): Promise<void> {
@@ -339,69 +400,29 @@ export class DriveBridge {
     const job = (await this.db.first('SELECT * FROM drive_files WHERE file_id = ?', fileId))!;
     const participantId = String(job.participant_id);
     try {
-      const client = this.client(accountId);
-      const file = await client.getFile(fileId);
-      const outboxes = await this.outboxes(accountId);
-      if (file.trashed) return this.finishFile(fileId, 'rejected', 'trashed_before_import');
-      if (this.eligible(file, outboxes) !== participantId) return this.finishFile(fileId, 'rejected', 'no_longer_in_outbox');
-      if (file.size !== undefined && file.size > MAX_MESSAGE_BYTES) return this.finishFile(fileId, 'rejected', 'too_large');
-      let text: string;
-      try {
-        text = file.mimeType === GOOGLE_DOC ? await client.exportText(fileId, MAX_MESSAGE_BYTES) : await client.download(fileId, MAX_MESSAGE_BYTES);
-      } catch (err) {
-        if (err instanceof DriveError && err.kind === 'too_large') return this.finishFile(fileId, 'rejected', 'too_large');
-        throw err;
+      // Once a request is pinned, retries replay exactly it; the (mutable) source is not reread.
+      let pin: PinnedRequest | null = job.pinned_request ? JSON.parse(String(job.pinned_request)) as PinnedRequest : null;
+      if (!pin) {
+        const prepared = await this.prepare(fileId, accountId, participantId, Number(job.attempts));
+        if (!prepared) return;
+        pin = prepared;
       }
-      const msg = parseMessage(text);
-      if (!msg.ok) return this.finishFile(fileId, 'rejected', `malformed:${msg.reason}`);
-
-      const bodyDigest = await sha256Hex(msg.body);
-      const seen = await this.db.first('SELECT body_digest, file_id, post_id FROM drive_messages WHERE participant_id = ? AND message_id = ?', participantId, msg.id);
-      if (seen && seen.file_id !== fileId) {
-        if (seen.body_digest === bodyDigest) return this.finishFile(fileId, 'duplicate', 'same_id_same_body', msg.id, seen.post_id as string | null);
-        return this.finishFile(fileId, 'rejected', 'id_reused_with_different_body', msg.id);
-      }
-
       const actor = await this.actor(participantId);
       if (!actor) return this.finishFile(fileId, 'rejected', 'participant_unavailable');
-      const key = `drive.${msg.id}`;
+      const key = `drive.${pin.messageId}`;
       let postId: string;
-      if (msg.target.kind === 'new_thread') {
-        // A new thread goes into the session that is open now, and only if
-        // the file was created during it: a message written for an earlier
-        // session is never carried into a later one.
-        const current = await this.db.first('SELECT id FROM sessions ORDER BY generation DESC LIMIT 1');
-        const session = current ? await loadSession(this.db, String(current.id)) : null;
-        if (!session || effectiveStatus(session, this.clock.now()).state !== 'open') return this.finishFile(fileId, 'rejected', 'session_closed', msg.id);
-        if (Date.parse(file.createdTime) < Date.parse(session.openedAt)) return this.finishFile(fileId, 'rejected', 'stale_session', msg.id);
-        const r = await this.ledger.createThread(actor, session.id,
-          { title: msg.target.title, tags: msg.target.tags, body: msg.body, generation: session.generation }, key);
+      if (pin.kind === 'thread') {
+        const r = await this.ledger.createThread(actor, pin.sessionId, { title: pin.title, tags: pin.tags, body: pin.body, generation: pin.generation }, key);
         postId = r.value.post.id;
       } else {
-        let threadId: string;
-        let replyTo: string | undefined;
-        if (msg.target.kind === 'reply') {
-          const target = await loadPost(this.db, msg.target.postId);
-          if (!target) return this.finishFile(fileId, 'rejected', 'unknown_reply_target', msg.id);
-          threadId = target.threadId;
-          replyTo = target.id;
-        } else {
-          threadId = msg.target.threadId;
-        }
-        const thread = await loadThread(this.db, threadId);
-        if (!thread) return this.finishFile(fileId, 'rejected', 'unknown_thread', msg.id);
-        const session = (await loadSession(this.db, thread.sessionId))!;
-        const raw: Record<string, unknown> = { body: msg.body, session_id: session.id, generation: session.generation };
-        if (replyTo) raw.reply_to_post_id = replyTo;
-        const r = await this.ledger.createPost(actor, threadId, raw, key);
+        const r = await this.ledger.createPost(actor, pin.threadId, pin.raw, key);
         postId = r.value.id;
       }
       await this.hooks.afterPost?.(fileId);
       await this.db.batch([
-        stmt(`INSERT OR IGNORE INTO drive_messages (participant_id, message_id, body_digest, file_id, post_id) VALUES (?, ?, ?, ?, ?)`,
-          participantId, msg.id, bodyDigest, fileId, postId),
+        stmt(`UPDATE drive_messages SET post_id = ? WHERE participant_id = ? AND message_id = ? AND file_id = ?`, postId, participantId, pin.messageId, fileId),
         stmt(`UPDATE drive_files SET state = 'accepted', message_id = ?, post_id = ?, reason = NULL, updated_at = ? WHERE file_id = ? AND state = 'pending'`,
-          msg.id, postId, this.now(), fileId),
+          pin.messageId, postId, this.now(), fileId),
       ]);
     } catch (err) {
       if (err instanceof ApiError && TERMINAL_CODES.has(err.code)) return this.finishFile(fileId, 'rejected', err.code.toLowerCase());
@@ -416,15 +437,106 @@ export class DriveBridge {
     }
   }
 
-  private async finishFile(fileId: string, state: 'rejected' | 'duplicate' | 'failed', reason: string, messageId?: string, postId?: string | null) {
-    await this.db.run(
-      `UPDATE drive_files SET state = ?, reason = ?, message_id = COALESCE(?, message_id), post_id = COALESCE(?, post_id), updated_at = ?
-       WHERE file_id = ? AND state = 'pending'`,
-      state, reason, messageId ?? null, postId ?? null, this.now(), fileId);
+  /**
+   * Reads, parses, and checks a file, resolves its target, and pins the
+   * resulting ledger request together with its message-ID reservation, in
+   * one batch. Edits before this point are imported; edits after it are
+   * counted and ignored. Returns null when the file was settled (rejected,
+   * duplicate) or must wait.
+   */
+  private async prepare(fileId: string, accountId: string, participantId: string, attempts: number): Promise<PinnedRequest | null> {
+    const client = this.client(accountId);
+    const file = await client.getFile(fileId);
+    const outboxes = await this.outboxes(accountId);
+    if (file.trashed) { await this.finishFile(fileId, 'rejected', 'trashed_before_import'); return null; }
+    if (this.eligible(file, outboxes) !== participantId) { await this.finishFile(fileId, 'rejected', 'no_longer_in_outbox'); return null; }
+    if (file.size !== undefined && file.size > MAX_MESSAGE_BYTES) { await this.finishFile(fileId, 'rejected', 'too_large'); return null; }
+    let text: string;
+    try {
+      text = file.mimeType === GOOGLE_DOC ? await client.exportText(fileId, MAX_MESSAGE_BYTES) : await client.download(fileId, MAX_MESSAGE_BYTES);
+    } catch (err) {
+      if (err instanceof DriveError && err.kind === 'too_large') { await this.finishFile(fileId, 'rejected', 'too_large'); return null; }
+      throw err;
+    }
+    const msg = parseMessage(text);
+    if (!msg.ok) { await this.finishFile(fileId, 'rejected', `malformed:${msg.reason}`); return null; }
+    const bodyDigest = await sha256Hex(msg.body);
+    if (!(await this.checkMessageId(fileId, participantId, msg.id, bodyDigest, attempts))) return null;
+    if (!(await this.actor(participantId))) { await this.finishFile(fileId, 'rejected', 'participant_unavailable'); return null; }
+
+    let pin: PinnedRequest;
+    if (msg.target.kind === 'new_thread') {
+      // A new thread goes into the session that is open now, and only if
+      // the file was created during it: a message written for an earlier
+      // session is never carried into a later one.
+      const current = await this.db.first('SELECT id FROM sessions ORDER BY generation DESC LIMIT 1');
+      const session = current ? await loadSession(this.db, String(current.id)) : null;
+      if (!session || effectiveStatus(session, this.clock.now()).state !== 'open') { await this.finishFile(fileId, 'rejected', 'session_closed', msg.id); return null; }
+      if (Date.parse(file.createdTime) < Date.parse(session.openedAt)) { await this.finishFile(fileId, 'rejected', 'stale_session', msg.id); return null; }
+      pin = { kind: 'thread', messageId: msg.id, sessionId: session.id, generation: session.generation, title: msg.target.title, tags: msg.target.tags, body: msg.body };
+    } else {
+      let threadId: string;
+      let replyTo: string | undefined;
+      if (msg.target.kind === 'reply') {
+        const target = await loadPost(this.db, msg.target.postId);
+        if (!target) { await this.finishFile(fileId, 'rejected', 'unknown_reply_target', msg.id); return null; }
+        threadId = target.threadId;
+        replyTo = target.id;
+      } else {
+        threadId = msg.target.threadId;
+      }
+      const thread = await loadThread(this.db, threadId);
+      if (!thread) { await this.finishFile(fileId, 'rejected', 'unknown_thread', msg.id); return null; }
+      const session = (await loadSession(this.db, thread.sessionId))!;
+      const raw: Record<string, unknown> = { body: msg.body, session_id: session.id, generation: session.generation };
+      if (replyTo) raw.reply_to_post_id = replyTo;
+      pin = { kind: 'post', messageId: msg.id, threadId, raw };
+    }
+
+    // Reserve the message ID for this file and pin the request, atomically.
+    // The pin only lands if this file holds the reservation.
+    await this.db.batch([
+      stmt(`INSERT OR IGNORE INTO drive_messages (participant_id, message_id, body_digest, file_id, post_id) VALUES (?, ?, ?, ?, NULL)`,
+        participantId, msg.id, bodyDigest, fileId),
+      stmt(`UPDATE drive_files SET pinned_request = ?, message_id = ?, updated_at = ?
+            WHERE file_id = ? AND state = 'pending' AND pinned_request IS NULL
+              AND EXISTS (SELECT 1 FROM drive_messages WHERE participant_id = ? AND message_id = ? AND file_id = ?)`,
+        JSON.stringify(pin), msg.id, this.now(), fileId, participantId, msg.id, fileId),
+    ]);
+    const after = await this.db.first('SELECT pinned_request FROM drive_files WHERE file_id = ?', fileId);
+    if (after?.pinned_request) return JSON.parse(String(after.pinned_request)) as PinnedRequest;
+    // Another file took this message ID between the check and the batch: settle against it.
+    await this.checkMessageId(fileId, participantId, msg.id, bodyDigest, attempts);
+    return null;
   }
 
-  private async retryFile(fileId: string, attempts: number, err: unknown) {
-    const reason = err instanceof DriveError ? err.kind : err instanceof ApiError ? err.code.toLowerCase() : 'internal';
+  /**
+   * A message ID belongs to the first file that reserves it. Another file
+   * with the same ID and body is a duplicate (linked once the original has
+   * its post; until then it waits with backoff); with a different body it
+   * is refused. Returns true when this file may proceed.
+   */
+  private async checkMessageId(fileId: string, participantId: string, messageId: string, bodyDigest: string, attempts: number): Promise<boolean> {
+    const seen = await this.db.first('SELECT body_digest, file_id, post_id FROM drive_messages WHERE participant_id = ? AND message_id = ?', participantId, messageId);
+    if (!seen || seen.file_id === fileId) return true;
+    if (seen.body_digest !== bodyDigest) { await this.finishFile(fileId, 'rejected', 'id_reused_with_different_body', messageId); return false; }
+    if (seen.post_id) { await this.finishFile(fileId, 'duplicate', 'same_id_same_body', messageId, String(seen.post_id)); return false; }
+    await this.retryFile(fileId, attempts, new Error('waiting_for_original'), 'waiting_for_original');
+    return false;
+  }
+
+  private async finishFile(fileId: string, state: 'rejected' | 'duplicate' | 'failed', reason: string, messageId?: string, postId?: string | null) {
+    const statements = [stmt(
+      `UPDATE drive_files SET state = ?, reason = ?, message_id = COALESCE(?, message_id), post_id = COALESCE(?, post_id), updated_at = ?
+       WHERE file_id = ? AND state = 'pending'`,
+      state, reason, messageId ?? null, postId ?? null, this.now(), fileId)];
+    // A refused file gives its message-ID reservation back, so a corrected resend can use it.
+    if (state === 'rejected') statements.push(stmt(`DELETE FROM drive_messages WHERE file_id = ? AND post_id IS NULL`, fileId));
+    await this.db.batch(statements);
+  }
+
+  private async retryFile(fileId: string, attempts: number, err: unknown, label?: string) {
+    const reason = label ?? (err instanceof DriveError ? err.kind : err instanceof ApiError ? err.code.toLowerCase() : 'internal');
     if (attempts >= LIMITS.maxAttempts) return this.finishFile(fileId, 'failed', `gave_up:${reason}`);
     await this.db.run(`UPDATE drive_files SET reason = ?, next_attempt_at = ?, updated_at = ? WHERE file_id = ? AND state = 'pending'`,
       `retrying:${reason}`, iso(this.clock.now() + backoff(attempts)), this.now(), fileId);
@@ -474,11 +586,19 @@ export class DriveBridge {
     return n;
   }
 
-  /** Writes due deliveries (bounded), one claimed delivery at a time. */
+  /**
+   * Writes due deliveries (bounded), one claimed delivery at a time. Rows
+   * held for an account without access are filtered out before the limit,
+   * so they never crowd out recipients whose accounts work.
+   */
   async deliver(): Promise<number> {
     const nowMs = this.clock.now();
     const due = await this.db.all(
-      `SELECT id FROM drive_deliveries WHERE state IN ('pending', 'uncertain') AND next_attempt_at <= ? ORDER BY created_at LIMIT ?`,
+      `SELECT d.id FROM drive_deliveries d
+         JOIN drive_participants m ON m.participant_id = d.recipient_id
+         JOIN drive_accounts a ON a.id = m.account_id
+       WHERE d.state IN ('pending', 'uncertain') AND d.next_attempt_at <= ? AND (a.access_state = 'ok' OR m.enabled = 0)
+       ORDER BY d.created_at, d.id LIMIT ?`,
       iso(nowMs), LIMITS.deliveriesPerRun);
     let done = 0;
     for (const row of due) {
@@ -492,59 +612,99 @@ export class DriveBridge {
     return done;
   }
 
+  /** The recipient's mapping and account state, read fresh. */
+  private async recipient(participantId: string) {
+    return (await this.db.first(
+      `SELECT m.inbox_folder_id, m.account_id, m.enabled, a.access_state
+       FROM drive_participants m JOIN drive_accounts a ON a.id = m.account_id WHERE m.participant_id = ?`, participantId))!;
+  }
+
+  /**
+   * One delivery under this worker's claim. The claim number (attempts after
+   * claiming) fences every update: a worker whose claim expired and was
+   * taken over cannot change the row any more.
+   *
+   * Ordering with moderation: publication state and the recipient mapping
+   * are reread after any lookup and immediately before files.create. A
+   * redaction or disablement completed before that check prevents the
+   * write. A create already started cannot be recalled; if the post was
+   * redacted while it ran, the delivery is recorded as
+   * 'redacted_after_write' for the owner to remove by hand.
+   */
   private async deliverOne(id: string): Promise<boolean> {
-    const d = (await this.db.first(
-      `SELECT d.*, m.inbox_folder_id, m.account_id, m.enabled, a.access_state
-       FROM drive_deliveries d JOIN drive_participants m ON m.participant_id = d.recipient_id JOIN drive_accounts a ON a.id = m.account_id
-       WHERE d.id = ?`, id))!;
-    const post = await loadPost(this.db, String(d.post_id));
-    // Removed text is never delivered; a disabled recipient gets nothing new.
-    if (!post || post.publicationState !== 'published') return this.endDelivery(id, 'skipped', 'post_removed');
-    if (Number(d.enabled) !== 1) return this.endDelivery(id, 'skipped', 'recipient_disabled');
-    if (d.access_state !== 'ok') {
-      await this.db.run(`UPDATE drive_deliveries SET attempts = attempts - 1, last_error = 'account_access_lost' WHERE id = ?`, id);
-      return false;
-    }
-    const client = this.client(String(d.account_id));
-    const folder = String(d.inbox_folder_id);
+    const d = (await this.db.first('SELECT * FROM drive_deliveries WHERE id = ?', id))!;
+    const claimNo = Number(d.attempts);
+    const recipientId = String(d.recipient_id);
+    const gate = async (): Promise<'go' | 'held' | 'skipped'> => {
+      const post = await loadPost(this.db, String(d.post_id));
+      const m = await this.recipient(recipientId);
+      // Removed text is never delivered; a disabled recipient gets nothing new.
+      if (!post || post.publicationState !== 'published') { await this.endDelivery(id, claimNo, 'skipped', 'post_removed'); return 'skipped'; }
+      if (Number(m.enabled) !== 1) { await this.endDelivery(id, claimNo, 'skipped', 'recipient_disabled'); return 'skipped'; }
+      if (m.access_state !== 'ok') {
+        await this.db.run(`UPDATE drive_deliveries SET attempts = attempts - 1, last_error = 'account_access_lost' WHERE id = ? AND attempts = ?`, id, claimNo);
+        return 'held';
+      }
+      return 'go';
+    };
+    if ((await gate()) !== 'go') return false;
+    const first = await this.recipient(recipientId);
+    const accountId = String(first.account_id);
+    const folder = String(first.inbox_folder_id);
+    const client = this.client(accountId);
     try {
       // Any earlier attempt may have written the file: look before writing again.
-      if (Number(d.attempts) > 1 || d.state === 'uncertain') {
+      if (claimNo > 1 || d.state === 'uncertain') {
         const found = await client.findByAppProperty(folder, 'salonDelivery', id);
-        if (found) return this.endDelivery(id, 'delivered', null, found.id);
+        if (found) return this.endDelivery(id, claimNo, 'delivered', null, found.id);
       }
+      // Authoritative state again, after the lookup and right before the write.
+      if ((await gate()) !== 'go') return false;
+      const now = await this.recipient(recipientId);
+      if (String(now.inbox_folder_id) !== folder || String(now.account_id) !== accountId) {
+        // The mapping moved during the lookup: try again from the start, uncounted.
+        await this.db.run(`UPDATE drive_deliveries SET attempts = attempts - 1, state = 'uncertain', next_attempt_at = ? WHERE id = ? AND attempts = ?`,
+          this.now(), id, claimNo);
+        return false;
+      }
+      const post = (await loadPost(this.db, String(d.post_id)))!;
       const thread = (await loadThread(this.db, post.threadId))!;
       const author = await this.db.first('SELECT display_name FROM participants WHERE id = ?', post.authorId);
       const content = renderDelivery({
         postId: post.id, from: String(author?.display_name ?? 'Unknown'), sessionId: post.sessionId, threadId: thread.id,
         threadTitle: thread.title, replyTo: post.replyToPostId, postedAt: post.createdAt, body: post.body,
       });
+      if (post.publicationState !== 'published') return this.endDelivery(id, claimNo, 'skipped', 'post_removed');
       const created = await client.createTextFile(folder, `salon-${post.id}.txt`, content, { salonBridge: '1', salonDelivery: id });
-      return this.endDelivery(id, 'delivered', null, created.id);
+      // Every created file is logged, even by a worker that lost its claim, so duplicates are visible.
+      await this.db.run(`INSERT OR IGNORE INTO drive_delivery_writes (delivery_id, remote_file_id, attempt, created_at) VALUES (?, ?, ?, ?)`,
+        id, created.id, claimNo, this.now());
+      const after = await loadPost(this.db, post.id);
+      const note = after?.publicationState === 'published' ? null : 'redacted_after_write';
+      return this.endDelivery(id, claimNo, 'delivered', note, created.id);
     } catch (err) {
       const kind = err instanceof DriveError ? err.kind : 'internal';
       if (kind === 'auth') {
-        await this.accountError(String(d.account_id), err);
-        await this.db.run(`UPDATE drive_deliveries SET attempts = attempts - 1, state = 'uncertain', last_error = 'account_access_lost' WHERE id = ?`, id);
+        await this.accountError(accountId, err);
+        await this.db.run(`UPDATE drive_deliveries SET attempts = attempts - 1, state = 'uncertain', last_error = 'account_access_lost' WHERE id = ? AND attempts = ?`, id, claimNo);
         return false;
       }
-      if (kind === 'not_found' || kind === 'permanent' || kind === 'too_large') return this.endDelivery(id, 'failed', kind);
-      const attempts = Number(d.attempts);
-      if (attempts >= LIMITS.maxAttempts) return this.endDelivery(id, 'failed', `gave_up:${kind}`);
+      if (kind === 'not_found' || kind === 'permanent' || kind === 'too_large') return this.endDelivery(id, claimNo, 'failed', kind);
+      if (claimNo >= LIMITS.maxAttempts) return this.endDelivery(id, claimNo, 'failed', `gave_up:${kind}`);
       // A timeout or server error may have written the file anyway.
-      await this.db.run(`UPDATE drive_deliveries SET state = 'uncertain', last_error = ?, next_attempt_at = ? WHERE id = ?`,
-        kind, iso(this.clock.now() + backoff(attempts)), id);
+      await this.db.run(`UPDATE drive_deliveries SET state = 'uncertain', last_error = ?, next_attempt_at = ? WHERE id = ? AND attempts = ?`,
+        kind, iso(this.clock.now() + backoff(claimNo)), id, claimNo);
       return false;
     }
   }
 
-  private async endDelivery(id: string, state: 'delivered' | 'failed' | 'skipped', error: string | null, remoteId?: string): Promise<boolean> {
-    await this.db.run(
+  private async endDelivery(id: string, claimNo: number, state: 'delivered' | 'failed' | 'skipped', error: string | null, remoteId?: string): Promise<boolean> {
+    const r = await this.db.run(
       `UPDATE drive_deliveries SET state = ?, last_error = ?, remote_file_id = COALESCE(?, remote_file_id),
          delivered_at = CASE WHEN ? = 'delivered' THEN ? ELSE delivered_at END, claimed_until = NULL
-       WHERE id = ? AND state IN ('pending', 'uncertain')`,
-      state, error, remoteId ?? null, state, this.now(), id);
-    return state === 'delivered';
+       WHERE id = ? AND state IN ('pending', 'uncertain') AND attempts = ?`,
+      state, error, remoteId ?? null, state, this.now(), id, claimNo);
+    return r.changes === 1 && state === 'delivered';
   }
 
   // ---- whole run and owner controls -----------------------------------------------
@@ -577,6 +737,11 @@ export class DriveBridge {
         `SELECT 'file' AS kind, file_id AS id, participant_id, reason FROM drive_files WHERE state IN ('failed', 'rejected')
          UNION ALL SELECT 'delivery', id, recipient_id, last_error FROM drive_deliveries WHERE state = 'failed'
          ORDER BY kind LIMIT 50`),
+      // Deliveries needing a look: more than one inbox file written, or redacted while being written.
+      attention: await this.db.all(
+        `SELECT d.id, d.recipient_id, CASE WHEN w.n > 1 THEN 'duplicate_write' ELSE d.last_error END AS reason, COALESCE(w.n, 0) AS writes
+         FROM drive_deliveries d LEFT JOIN (SELECT delivery_id, COUNT(*) AS n FROM drive_delivery_writes GROUP BY delivery_id) w ON w.delivery_id = d.id
+         WHERE w.n > 1 OR d.last_error = 'redacted_after_write' ORDER BY d.created_at LIMIT 50`),
     };
   }
 

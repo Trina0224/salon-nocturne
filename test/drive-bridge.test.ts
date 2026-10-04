@@ -366,6 +366,221 @@ test('Drive: hostile content stays inert text in Salon pages and deliveries', as
   assert.equal(delivered.split('\n---\n')[0]!.includes('<script>'), false);
 });
 
+test('Drive: a redaction or disablement completed during a delivery lookup prevents the write; a write already started is reported', async () => {
+  const w = await driveWorld();
+  const redact = async (postId: string) => {
+    const r = await w.call('POST', `/api/v1/admin/posts/${postId}/moderate`, { token: TOKENS.owner, body: { action: 'redact', reason: 'test', expected_revision: 1 } });
+    assert.equal(r.status, 200);
+  };
+  const deliveries = (postId: string) => JSON.parse(JSON.stringify(w.raw.prepare(
+    `SELECT p.display_name AS name, d.state, d.last_error FROM drive_deliveries d JOIN participants p ON p.id = d.recipient_id WHERE d.post_id = ? ORDER BY p.display_name`).all(postId)));
+
+  // 1. Redaction while an uncertain retry is looking for an earlier write.
+  w.mock.fail('createTextFile', 'transient', { account: B, times: 3 });
+  w.write('Grok', msg({ id: 'grok-red-01', title: 'Redact me', body: 'Old text that must not leave.' }));
+  await w.bridge.runOnce('worker-1');
+  const p1 = w.posts()[0].id;
+  assert.equal(w.raw.prepare(`SELECT COUNT(*) AS n FROM drive_deliveries WHERE post_id = ? AND state = 'uncertain'`).get(p1)!.n, 3);
+  w.clock.advance(LIMITS.baseBackoffMs + 1);
+  const lookup = w.mock.block('findByAppProperty', { account: B });
+  const run = w.bridge.deliver();
+  await lookup.reached;
+  await redact(p1);
+  assert.equal(w.posts()[0].body, '', 'the stored body is gone');
+  lookup.release();
+  await run;
+  for (const n of ['Rei', 'Claude', 'Muse'] as const) assert.ok(!w.inboxOf(n).some((t) => t.includes('Old text')), n);
+  assert.deepEqual(deliveries(p1).filter((d: Json) => d.name !== 'Spark').map((d: Json) => [d.state, d.last_error]),
+    [['skipped', 'post_removed'], ['skipped', 'post_removed'], ['skipped', 'post_removed']]);
+
+  // 2. The recipient's mapping is disabled at the same boundary.
+  w.mock.fail('createTextFile', 'transient', { account: B, times: 3 });
+  w.write('Grok', msg({ id: 'grok-dis-01', title: 'Disable', body: 'Not for a disabled mapping.' }));
+  await w.bridge.runOnce('worker-1');
+  const p2 = w.posts()[1].id;
+  w.clock.advance(LIMITS.baseBackoffMs + 1);
+  const lookup2 = w.mock.block('findByAppProperty', { account: B });
+  const run2 = w.bridge.deliver();
+  await lookup2.reached;
+  w.raw.prepare('UPDATE drive_participants SET enabled = 0 WHERE participant_id IN (?, ?, ?)').run(w.ids.Rei, w.ids.Claude, w.ids.Muse);
+  lookup2.release();
+  await run2;
+  for (const n of ['Rei', 'Claude', 'Muse'] as const) assert.ok(!w.inboxOf(n).some((t) => t.includes('Not for a disabled')), n);
+  assert.ok(deliveries(p2).filter((d: Json) => d.name !== 'Spark').every((d: Json) => d.state === 'skipped' && d.last_error === 'recipient_disabled'));
+  w.raw.prepare('UPDATE drive_participants SET enabled = 1').run();
+
+  // 3. A create already in flight cannot be recalled: it lands, and the owner is told.
+  w.write('Grok', msg({ id: 'grok-late-01', title: 'In flight', body: 'Written before the redaction.' }));
+  await w.bridge.runAccount(A, 'worker-1');
+  await w.bridge.processFiles();
+  await w.bridge.fanOut();
+  const p3 = w.posts()[2].id;
+  const create = w.mock.block('createTextFile', { account: B });
+  const run3 = w.bridge.deliver();
+  await create.reached;
+  await redact(p3);
+  create.release();
+  await run3;
+  const late = deliveries(p3).filter((d: Json) => d.last_error === 'redacted_after_write');
+  assert.equal(late.length, 1, 'exactly the in-flight write is reported');
+  assert.equal(late[0].state, 'delivered');
+  assert.equal([...['Rei', 'Claude', 'Muse'] as const].filter((n) => w.inboxOf(n).some((t) => t.includes('Written before'))).length, 1, 'no later write exported the text');
+  const status = (await w.call('GET', '/api/v1/admin/drive', { token: TOKENS.owner })).body;
+  assert.ok(status.attention.some((a: Json) => a.reason === 'redacted_after_write'));
+});
+
+test('Drive: invalid-cursor recovery pages through every outbox across runs before adopting the fresh cursor', async () => {
+  let crashAt = 3;
+  let checkpoints = 0;
+  const w = await driveWorld({ hooks: { beforeCheckpoint: () => { if (++checkpoints === crashAt) throw new Error('crash before checkpoint'); } } });
+  w.mock.folderPageSize = 1;
+  for (let i = 0; i < 6; i++) w.write('Claude', msg({ id: `claude-rec-${i}`, title: `Claude ${i}`, body: `Claude recovery ${i}` }));
+  for (let i = 0; i < 3; i++) w.write('Muse', msg({ id: `muse-rec-${i}`, title: `Muse ${i}`, body: `Muse recovery ${i}` }));
+  // The stored cursor becomes invalid; the files are now only reachable by scanning the outboxes.
+  w.mock.invalidateTokens(B);
+  const acct = () => w.raw.prepare('SELECT page_token, recovery_token, recovery_folder, recovery_page FROM drive_accounts WHERE id = ?').get(B) as Json;
+  const oldToken = acct().page_token;
+  const recordedFiles = () => Number(w.raw.prepare('SELECT COUNT(*) AS n FROM drive_files').get()!.n);
+
+  // Run 1 crashes before its third checkpoint: two pages recorded, position saved, old cursor kept.
+  await w.bridge.runAccount(B, 'worker-1');
+  assert.equal(recordedFiles(), 2);
+  assert.equal(acct().page_token, oldToken, 'the fresh cursor is not adopted early');
+  assert.ok(acct().recovery_token);
+  assert.equal(acct().recovery_folder, out('Claude'));
+  crashAt = 0;
+  // A file written after the fresh token: found by the scan and by the change feed, recorded once.
+  w.write('Claude', msg({ id: 'claude-rec-new', title: 'During', body: 'Written during recovery.' }));
+  // Run 2 is interrupted by a Drive error.
+  w.mock.fail('listFolder', 'transient', { account: B, times: 1 });
+  await w.bridge.runAccount(B, 'worker-1');
+  assert.equal(recordedFiles(), 2);
+  assert.equal(acct().page_token, oldToken);
+  // Further runs, five pages each, finish the scan.
+  let runs = 0;
+  while (acct().recovery_token && runs++ < 10) {
+    await w.bridge.runAccount(B, 'worker-1');
+    if (acct().recovery_token) assert.equal(acct().page_token, oldToken, 'still the old cursor while pages remain');
+  }
+  assert.ok(runs >= 2, 'recovery needed more than one bounded run');
+  assert.equal(acct().recovery_token, null);
+  assert.notEqual(acct().page_token, oldToken);
+  assert.equal(recordedFiles(), 10, 'every pre-existing file plus the new one, without gaps');
+  await w.bridge.runAccount(B, 'worker-1');
+  for (let i = 0; i < 4; i++) await w.bridge.processFiles();
+  const bodies = w.posts().map((p) => p.body).sort();
+  assert.equal(bodies.length, 10);
+  assert.equal(new Set(bodies).size, 10, 'nothing published twice');
+  assert.ok(bodies.includes('Written during recovery.'));
+});
+
+test('Drive: a retry after a crash replays the pinned request, not an edited source', async () => {
+  const crashOnce = new Set<string>();
+  const w = await driveWorld({ hooks: { afterPost: (fileId) => { if (crashOnce.delete(fileId)) throw new Error('crash after post'); } } });
+  const edited = w.write('Spark', msg({ id: 'spark-pin-01', title: 'Pinned', body: 'The accepted text.' }));
+  const unchanged = w.write('Grok', msg({ id: 'grok-pin-01', title: 'Unchanged', body: 'Same source on retry.' }));
+  crashOnce.add(edited);
+  crashOnce.add(unchanged);
+  await w.bridge.runOnce('worker-1');
+  assert.equal(w.posts().length, 2);
+  assert.equal(w.file(edited).state, 'pending');
+  assert.ok(w.file(edited).pinned_request);
+  const opener = w.posts().find((p) => p.body === 'Same source on retry.')!;
+  // The same file now claims a different message ID, body, and target.
+  w.mock.edit(edited, msg({ id: 'spark-pin-02', replyTo: opener.id, body: 'A rewritten message.' }));
+  w.clock.advance(LIMITS.baseBackoffMs + 1);
+  await w.bridge.runOnce('worker-1');
+  await w.bridge.runOnce('worker-1');
+  const posts = w.posts();
+  assert.deepEqual(posts.map((p) => p.body).sort(), ['Same source on retry.', 'The accepted text.']);
+  const sparkPost = posts.find((p) => p.author_id === w.ids.Spark)!;
+  assert.equal(w.file(edited).state, 'accepted');
+  assert.equal(w.file(edited).message_id, 'spark-pin-01');
+  assert.equal(w.file(edited).post_id, sparkPost.id);
+  assert.equal(w.file(edited).later_changes, 1, 'the edit after pinning is counted, not imported');
+  assert.equal(w.file(unchanged).state, 'accepted');
+  assert.equal(w.file(unchanged).post_id, opener.id);
+  const messages = JSON.parse(JSON.stringify(w.raw.prepare('SELECT message_id, file_id, post_id FROM drive_messages WHERE participant_id = ?').all(w.ids.Spark)));
+  assert.deepEqual(messages, [{ message_id: 'spark-pin-01', file_id: edited, post_id: sparkPost.id }]);
+  const receipts = JSON.parse(JSON.stringify(w.raw.prepare('SELECT idempotency_key, result_id FROM write_receipts WHERE participant_id = ?').all(w.ids.Spark)));
+  assert.equal(receipts.length, 1, 'one quota charge, one receipt');
+  assert.equal(receipts[0].idempotency_key, 'drive.spark-pin-01');
+});
+
+test('Drive: deliveries held for an account without access do not starve a healthy account', async () => {
+  const w = await driveWorld();
+  w.raw.prepare(`UPDATE drive_accounts SET access_state = 'lost' WHERE id = ?`).run(A);
+  const { thread } = await w.startThread(w.session.id, w.session.generation, TOKENS.owner);
+  for (let i = 0; i < 26; i++) w.write('Rei', msg({ id: `rei-held-${String(i).padStart(2, '0')}`, thread: thread.id, body: `Held ${i}` }));
+  for (let i = 0; i < 6; i++) { await w.bridge.runOnce('worker-1'); w.clock.advance(5 * 60_000); }
+  const heldA = () => Number(w.raw.prepare(`SELECT COUNT(*) AS n FROM drive_deliveries d JOIN drive_participants m ON m.participant_id = d.recipient_id
+    WHERE m.account_id = ? AND d.state IN ('pending', 'uncertain')`).get(A)!.n);
+  assert.ok(heldA() > LIMITS.deliveriesPerRun, 'more held rows than one batch');
+  // A newer message for the healthy account B.
+  w.write('Rei', msg({ id: 'rei-held-new', thread: thread.id, body: 'For the healthy account.' }));
+  for (let i = 0; i < 3; i++) { await w.bridge.runOnce('worker-1'); w.clock.advance(5 * 60_000); }
+  for (const n of ['Claude', 'Muse'] as const) assert.ok(w.inboxOf(n).some((t) => t.includes('For the healthy account.')), n);
+  // 28 posts (the owner's opener, 26 held messages, the new one), two A recipients each.
+  assert.equal(heldA(), 56, 'A\'s work is held, not failed');
+  assert.equal(w.inboxOf('Grok').length, 0);
+  // Restored: A's held work resumes without loss or duplication.
+  await w.call('POST', '/api/v1/admin/drive/requeue', { token: TOKENS.owner, body: { kind: 'account', id: A } });
+  for (let i = 0; i < 4; i++) { await w.bridge.runOnce('worker-1'); w.clock.advance(5 * 60_000); }
+  for (const n of ['Grok', 'Spark'] as const) {
+    const got = w.inboxOf(n);
+    assert.equal(got.length, 28, n);
+    assert.equal(new Set(got).size, 28, `${n}: no duplicates`);
+  }
+  assert.equal(heldA(), 0);
+});
+
+test('Drive: a create that outlives its claim can duplicate; the duplicate is recorded and shown, not silent', async () => {
+  const w = await driveWorld();
+  w.write('Grok', msg({ id: 'grok-slow-01', title: 'Slow', body: 'One stalled create.' }));
+  await w.bridge.runAccount(A, 'worker-1');
+  await w.bridge.processFiles();
+  await w.bridge.fanOut();
+  const stalled = w.mock.block('createTextFile', { account: B });
+  const first = w.bridge.deliver();
+  await stalled.reached;
+  // The first worker's claim expires; a second worker takes over and finishes.
+  w.clock.advance(LIMITS.claimMs + 1);
+  await w.bridge.deliver();
+  stalled.release();
+  await first;
+  const writes = JSON.parse(JSON.stringify(w.raw.prepare(
+    'SELECT delivery_id, COUNT(*) AS n FROM drive_delivery_writes GROUP BY delivery_id HAVING n > 1').all()));
+  assert.equal(writes.length, 1, 'one delivery was written twice');
+  const dup = w.raw.prepare('SELECT * FROM drive_deliveries WHERE id = ?').get(writes[0].delivery_id) as Json;
+  assert.equal(dup.state, 'delivered');
+  assert.equal(dup.attempts, 2, 'the late worker could not change the row it no longer held');
+  const name = (w.raw.prepare('SELECT display_name FROM participants WHERE id = ?').get(dup.recipient_id) as Json).display_name as Name;
+  assert.equal(w.inboxOf(name).length, 2, 'Drive has no conditional create: the duplicate exists');
+  const status = (await w.call('GET', '/api/v1/admin/drive', { token: TOKENS.owner })).body;
+  assert.deepEqual(status.attention.map((a: Json) => [a.id, a.reason, a.writes]), [[dup.id, 'duplicate_write', 2]]);
+  for (const n of ['Spark', 'Rei', 'Claude', 'Muse'] as const) if (n !== name) assert.equal(w.inboxOf(n).length, 1, n);
+});
+
+test('Drive: a worker that lost its claim cannot reopen a delivery another worker completed', async () => {
+  const w = await driveWorld();
+  w.write('Grok', msg({ id: 'grok-fence-1', title: 'Fence', body: 'Delivered once.' }));
+  await w.bridge.runAccount(A, 'worker-1');
+  await w.bridge.processFiles();
+  await w.bridge.fanOut();
+  const stalled = w.mock.block('createTextFile', { account: B });
+  const first = w.bridge.deliver();
+  await stalled.reached;
+  w.clock.advance(LIMITS.claimMs + 1);
+  await w.bridge.deliver();
+  // The stalled call now fails: its worker must not mark the finished delivery for another try.
+  stalled.release('transient');
+  await first;
+  assert.equal(w.raw.prepare(`SELECT COUNT(*) AS n FROM drive_deliveries WHERE state <> 'delivered'`).get()!.n, 0);
+  w.clock.advance(LIMITS.maxBackoffMs + 1);
+  await w.drain(2);
+  for (const n of ['Spark', 'Rei', 'Claude', 'Muse'] as const) assert.equal(w.inboxOf(n).length, 1, n);
+});
+
 test('Drive config: bounded, no folder reuse, https notifications, and fail-closed in the Worker', () => {
   const run = (c: unknown) => {
     const problems: string[] = [];

@@ -23,6 +23,9 @@ export class MockDrive {
   readonly calls: { account: string; method: string; arg?: string }[] = [];
   readonly channels = new Map<string, { account: string; resourceId: string; token: string; address: string; stopped: boolean }>();
   now: () => number = () => Date.now();
+  /** Files per listFolder page (tokens are offsets), so recovery really paginates. */
+  folderPageSize = 100;
+  private gates: { method: string; account?: string; reached: () => void; wait: Promise<DriveErrorKind | undefined> }[] = [];
 
   constructor(accounts: string[]) {
     for (const a of accounts) this.logs.set(a, []);
@@ -30,6 +33,29 @@ export class MockDrive {
 
   fail(method: string, kind: Fault['kind'], opts: { account?: string; times?: number } = {}) {
     this.faults.push({ method, account: opts.account, kind, times: opts.times ?? 1 });
+  }
+
+  /**
+   * Holds the next call of `method` (for `account`, if given) until
+   * release() is called. `reached` resolves once a call is waiting.
+   * release(kind) makes the held call fail with that error instead.
+   */
+  block(method: string, opts: { account?: string } = {}): { reached: Promise<void>; release: (fail?: DriveErrorKind) => void } {
+    let reached!: () => void;
+    let release!: (fail?: DriveErrorKind) => void;
+    const reachedP = new Promise<void>((r) => { reached = r; });
+    const wait = new Promise<DriveErrorKind | undefined>((r) => { release = r; });
+    this.gates.push({ method, account: opts.account, reached, wait });
+    return { reached: reachedP, release };
+  }
+
+  private async gate(account: string, method: string): Promise<void> {
+    const i = this.gates.findIndex((g) => g.method === method && (!g.account || g.account === account));
+    if (i < 0) return;
+    const [g] = this.gates.splice(i, 1);
+    g!.reached();
+    const fail = await g!.wait;
+    if (fail) throw new DriveError(fail);
   }
 
   private maybeFail(account: string, method: string): Fault['kind'] | null {
@@ -136,18 +162,23 @@ export class MockDrive {
         // Docs exports start with a byte-order mark.
         return capped(`﻿${f.content}`, max);
       },
-      listFolder: async (folderId) => {
+      listFolder: async (folderId, pageToken) => {
         call('listFolder', folderId);
-        return { files: [...this.files.values()].filter((f) => f.meta.parents.includes(folderId) && (f.owner === account || f.sharedWith.has(account))).map((f) => structuredClone(f.meta)) };
+        const all = [...this.files.values()].filter((f) => f.meta.parents.includes(folderId) && (f.owner === account || f.sharedWith.has(account)));
+        const from = pageToken ? Number(pageToken) : 0;
+        const end = from + this.folderPageSize;
+        return { files: all.slice(from, end).map((f) => structuredClone(f.meta)), ...(end < all.length ? { nextPageToken: String(end) } : {}) };
       },
       createTextFile: async (folderId, name, content, appProperties) => {
         const kind = call('createTextFile', folderId);
+        await this.gate(account, 'createTextFile');
         const id = this.addFile(account, folderId, { content, name, appProperties });
         if (kind === 'timeout_after_write') throw new DriveError('timeout');
         return { id };
       },
       findByAppProperty: async (folderId, key, value) => {
         call('findByAppProperty', folderId);
+        await this.gate(account, 'findByAppProperty');
         const f = [...this.files.values()].find((x) => x.meta.parents.includes(folderId) && x.meta.appProperties?.[key] === value);
         return f ? { id: f.meta.id } : null;
       },

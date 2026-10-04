@@ -28,7 +28,7 @@ test('D1: Drive outbox to ledger to inboxes, with an edit, a duplicate, a failin
   try {
     const owner = await s.auth.resolve(OWNER_TOKEN);
     if (owner.kind !== 'ok') throw new Error('owner');
-    await s.ledger.openSession(owner.actor, { title: 'D1 bridge', duration_minutes: 60, limits: { maxPosts: 50, maxPostsPerParticipant: 20, maxThreads: 5, maxBodyChars: 500 } });
+    await s.ledger.openSession(owner.actor, { title: 'D1 bridge', duration_minutes: 240, limits: { maxPosts: 50, maxPostsPerParticipant: 20, maxThreads: 10, maxBodyChars: 500 } });
     const bridge = s.drive!;
     await bridge.syncConfig();
     clock.advance(1000);
@@ -48,6 +48,26 @@ test('D1: Drive outbox to ledger to inboxes, with an edit, a duplicate, a failin
     assert.equal(mock.filesIn('in-grok').length, 0);
     const delivered = await s.db.first(`SELECT COUNT(*) AS n FROM drive_deliveries WHERE state = 'delivered'`);
     assert.equal(Number(delivered!.n), 2);
+    const pinned = await s.db.first(`SELECT pinned_request FROM drive_files WHERE state = 'accepted'`);
+    assert.match(String(pinned!.pinned_request), /grok-d1-01/);
+
+    // Invalid-cursor recovery over paginated outboxes, resumed across runs.
+    mock.folderPageSize = 1;
+    for (let i = 0; i < 6; i++) mock.addFile('account-b', 'out-muse', { content: `salon-message: 1\nid: muse-d1-0${i}\ntitle: Muse ${i}\n---\nRecovered ${i}.\n` });
+    mock.invalidateTokens('account-b');
+    const before = await s.db.first(`SELECT page_token FROM drive_accounts WHERE id = 'account-b'`);
+    await bridge.runAccount('account-b', 'w1');
+    const mid = await s.db.first(`SELECT page_token, recovery_token, recovery_folder FROM drive_accounts WHERE id = 'account-b'`);
+    assert.equal(mid!.page_token, before!.page_token);
+    assert.ok(mid!.recovery_token);
+    for (let i = 0; i < 3; i++) await bridge.runOnce('w1');
+    const end = await s.db.first(`SELECT page_token, recovery_token FROM drive_accounts WHERE id = 'account-b'`);
+    assert.equal(end!.recovery_token, null);
+    assert.notEqual(end!.page_token, before!.page_token);
+    const recovered = await s.db.all(`SELECT body FROM posts WHERE body LIKE 'Recovered %' ORDER BY body`);
+    assert.deepEqual(recovered.map((p) => p.body), ['Recovered 0.', 'Recovered 1.', 'Recovered 2.', 'Recovered 3.', 'Recovered 4.', 'Recovered 5.']);
+    const status = await bridge.status();
+    assert.deepEqual(status.attention, []);
   } finally {
     await s.dispose();
   }
