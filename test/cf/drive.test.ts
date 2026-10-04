@@ -92,6 +92,31 @@ test('D1: Drive outbox to ledger to inboxes, with an edit, a duplicate, a failin
     const after = await bridge.status();
     assert.ok(after.attention.length > 0);
     assert.ok(after.attention.every((a) => a.reason === 'delivered_before_redaction' && a.post_id === removed.id));
+
+    // A lost create response after redaction must retain a body-less warning on D1,
+    // even when the next attempt is terminally skipped before a Drive lookup.
+    mock.addFile('account-a', 'out-grok', { content: 'salon-message: 1\nid: grok-d1-unknown\ntitle: Unknown\n---\nUnacknowledged D1 text.\n' });
+    await bridge.runAccount('account-a', 'w1');
+    await bridge.processFiles();
+    await bridge.fanOut();
+    const uncertainPost = (await s.db.first(`SELECT id FROM posts WHERE body = 'Unacknowledged D1 text.'`))!;
+    const held = mock.block('createTextFile', { account: 'account-b' });
+    mock.fail('createTextFile', 'timeout_after_write', { account: 'account-b' });
+    const delivery = bridge.deliver();
+    await held.reached;
+    clock.advance(1000);
+    await s.ledger.moderatePost(owner.actor, String(uncertainPost.id), { action: 'redact', reason: 'test', expected_revision: 1 });
+    held.release();
+    await delivery;
+    clock.advance(LIMITS.maxBackoffMs + 1);
+    await bridge.deliver();
+    const warnings = (await bridge.status()).attention.filter((a) => a.post_id === uncertainPost.id);
+    assert.equal(warnings.length, 1);
+    assert.equal(warnings[0]!.reason, 'unresolved_redacted_write');
+    assert.equal(Number(warnings[0]!.writes), 0);
+    assert.equal((await s.db.first('SELECT state FROM drive_deliveries WHERE id = ?', String(warnings[0]!.id)))!.state, 'skipped');
+    assert.ok(!JSON.stringify(warnings).includes('Unacknowledged D1 text'));
+
   } finally {
     await s.dispose();
   }

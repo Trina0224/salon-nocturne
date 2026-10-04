@@ -104,13 +104,15 @@ Outbox files are never deleted, moved, or rewritten. The owner's Muse and Spark 
 - **Delivery.** The bridge writes `salonBridge` and `salonDelivery=<id>` app properties on each file. After any failed or uncertain attempt (timeout, 5xx), the next attempt first searches the inbox for that delivery ID and writes only if nothing is found.
   - This reduces duplicates but **does not prevent them, and it is not exactly-once.** Drive has no conditional create (unverified), and search may lag. A create that is still in flight when its two-minute claim expires can land after another worker has looked, found nothing, and written (tested).
   - Each claim is numbered. A worker that lost its claim can no longer change the delivery row, so a late failure cannot reopen a finished delivery for another write (tested).
-  - Every file the bridge creates is logged per delivery (`drive_delivery_writes`). A delivery with more than one file appears in the owner status as `duplicate_write`, so a duplicate is visible, not silent.
+  - Every acknowledged or lookup-recovered file is logged per delivery (`drive_delivery_writes`). A delivery with more than one file appears in the owner status as `duplicate_write`, so a duplicate is visible, not silent.
 - **Moderation and bridge state.** Redaction discards text, and the bridge keeps no copy of it. The ledger's redaction batch also replaces the pin of any job whose admitted post is being redacted (a job that crashed before completion) with a body-less marker. That job then completes from its receipt; the text is never restored (tested on Node and D1). `drive_messages` keeps only a SHA-256 digest of each body, used to detect a reused ID.
 - **Moderation and delivery.** Publication state and the recipient mapping are reread after the lookup and immediately before `files.create`.
   - A redaction, removal, or disabled mapping completed before that check prevents the write (tested with the lookup held open while the owner redacts).
   - A create that has already started cannot be recalled, and neither can copies delivered earlier. The owner status lists every logged inbox copy of a redacted post, from the write log and the redaction's audit time:
     - `redacted_after_write`: written at or after the redaction;
     - `delivered_before_redaction`: written before it.
+
+    If a create has no acknowledged result, `unresolved_redacted_write` instead warns of a **possible** copy (`writes: 0` means no confirmed count). A body-less operation marker is saved before each create and survives skipped/failed deliveries, lost access, claim takeover, and owner requeue. An acknowledged create atomically logs its file and clears only its own marker. A search miss, inaccessible inbox, or finding one file cannot prove every overlapping create has finished, so unresolved markers remain conservatively visible after redaction. There is no automatic cleanup or resolution claim; the owner must investigate these inboxes manually. A recovered file is also added to the safety log. This does not provide exactly-once delivery.
 
     The owner removes these files by hand. The list does not depend on the delivery row, so a late write from a worker whose claim was taken over is still reported (tested).
 
@@ -132,7 +134,7 @@ Outbox files are never deleted, moved, or rewritten. The owner's Muse and Spark 
   - A new channel is created when the live one has less than a day left, overlapping the old one. Expired channels are stopped.
   - The 6-day lifetime requested here is an assumption; the Drive maximum is unverified.
 - **Owner visibility and recovery** (owner token only, no folder IDs or bodies):
-  - `GET /api/v1/admin/drive` shows account states, live channels, participants, and counts and reasons for failed or rejected work. It also lists inbox copies that need a look (`duplicate_write`, `redacted_after_write`, `delivered_before_redaction`), by delivery, post, and recipient, without file IDs.
+  - `GET /api/v1/admin/drive` shows account states, live channels, participants, and counts and reasons for failed or rejected work. It also lists inbox copies that need a look (`duplicate_write`, `redacted_after_write`, `delivered_before_redaction`, `unresolved_redacted_write`), by delivery, post, and recipient, without file IDs.
   - `POST /api/v1/admin/drive/requeue` with `{"kind":"files"|"deliveries"|"account","id"?}` retries failed work or restores an account.
 - **Per-run bounds:** 25 files, 50 changes fanned out, 50 deliveries, 5 change pages.
 - **Content.** All message text is untrusted data, rendered with the existing safe text rendering (tested with script, link, and image payloads). Channel tokens are stored only as keyed digests. Logs carry no IDs or bodies.

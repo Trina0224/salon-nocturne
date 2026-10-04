@@ -117,3 +117,15 @@ CREATE TABLE drive_state (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+
+-- A create may reach Drive without returning its file ID. Keep its outcome
+-- independent of delivery claims, moderation, retry exhaustion and requeue.
+-- Only the acknowledged operation can remove its marker, in the same batch
+-- that logs its file. A search miss (or one found file) cannot prove that all
+-- overlapping creates have completed. No bodies or credentials are retained.
+CREATE TABLE drive_unresolved_writes (
+  id TEXT PRIMARY KEY,
+  delivery_id TEXT NOT NULL REFERENCES drive_deliveries(id),
+  started_at TEXT NOT NULL
+);
+CREATE INDEX drive_unresolved_writes_delivery ON drive_unresolved_writes(delivery_id);

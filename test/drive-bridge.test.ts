@@ -686,3 +686,71 @@ test('Drive config: bounded, no folder reuse, https notifications, and fail-clos
   assert.equal(worker.ok, false);
   assert.ok(!worker.ok && worker.problems.some((p) => /no Drive API client/.test(p)));
 });
+
+for (const mode of ['retry', 'takeover', 'lost access'] as const) {
+  test(`Drive: an unacknowledged create stays visible after redaction and ${mode}`, async () => {
+    const w = await driveWorld();
+    w.write('Grok', msg({ id: 'grok-lost-response', title: 'Uncertain copy', body: 'Synthetic removed text.' }));
+    await w.bridge.runAccount(A, 'worker-1');
+    await w.bridge.processFiles();
+    await w.bridge.fanOut();
+    const post = w.posts()[0];
+    const stalled = w.mock.block('createTextFile', { account: B });
+    w.mock.fail('createTextFile', 'timeout_after_write', { account: B });
+    const first = w.bridge.deliver();
+    await stalled.reached;
+    w.clock.advance(1000);
+    assert.equal((await w.call('POST', `/api/v1/admin/posts/${post.id}/moderate`, {
+      token: TOKENS.owner, body: { action: 'redact', reason: 'test', expected_revision: 1 },
+    })).status, 200);
+    const pending = w.raw.prepare('SELECT * FROM drive_unresolved_writes').all() as Json[];
+    assert.equal(pending.length, 1);
+    const deliveryId = pending[0].delivery_id;
+    // The warning already exists while the original create is in flight.
+    assert.ok((await w.bridge.status()).attention.some((a) => a.id === deliveryId && a.reason === 'unresolved_redacted_write'));
+    if (mode === 'takeover') {
+      w.clock.advance(LIMITS.claimMs + 1);
+      await w.bridge.deliver();
+    }
+    stalled.release();
+    await first;
+    if (mode === 'lost access') w.raw.prepare("UPDATE drive_accounts SET access_state = 'lost' WHERE id = ?").run(B);
+    w.clock.advance(LIMITS.maxBackoffMs + 1);
+    await w.bridge.deliver();
+    const row = w.raw.prepare('SELECT * FROM drive_deliveries WHERE id = ?').get(deliveryId) as Json;
+    assert.equal(row.state, mode === 'lost access' ? 'uncertain' : 'skipped');
+    const copies = [...w.mock.files.values()].filter((f) => f.meta.appProperties?.salonDelivery === deliveryId);
+    assert.equal(copies.length, 1);
+    assert.match(copies[0]!.content, /Synthetic removed text/);
+    assert.equal(w.raw.prepare('SELECT COUNT(*) AS n FROM drive_delivery_writes WHERE delivery_id = ?').get(deliveryId)!.n, 0);
+    const status = await w.bridge.status();
+    const warnings = status.attention.filter((a) => a.id === deliveryId && a.reason === 'unresolved_redacted_write');
+    assert.equal(warnings.length, 1);
+    assert.equal(warnings[0]!.writes, 0, 'unknown count is not a confirmed write');
+    assert.ok(!JSON.stringify(status).includes('Synthetic removed text'));
+    assert.ok(!JSON.stringify(status).includes(copies[0]!.meta.id));
+    assert.ok(!JSON.stringify(pending).includes('Synthetic removed text'));
+  });
+}
+
+test('Drive: lookup-recovered files enter the safety log without erasing ambiguous operations', async () => {
+  const w = await driveWorld();
+  w.write('Grok', msg({ id: 'grok-found-copy', title: 'Recovered copy', body: 'Synthetic recovered text.' }));
+  w.mock.fail('createTextFile', 'timeout_after_write', { account: B });
+  await w.bridge.runOnce('worker-1');
+  const pending = w.raw.prepare('SELECT * FROM drive_unresolved_writes').all() as Json[];
+  assert.equal(pending.length, 1);
+  const id = pending[0].delivery_id;
+  w.clock.advance(LIMITS.maxBackoffMs + 1);
+  await w.bridge.deliver();
+  assert.equal(w.raw.prepare('SELECT state FROM drive_deliveries WHERE id = ?').get(id)!.state, 'delivered');
+  assert.equal(w.raw.prepare('SELECT COUNT(*) AS n FROM drive_delivery_writes WHERE delivery_id = ?').get(id)!.n, 1);
+  assert.equal(w.raw.prepare('SELECT COUNT(*) AS n FROM drive_unresolved_writes WHERE delivery_id = ?').get(id)!.n, 1);
+  const post = w.posts()[0];
+  w.clock.advance(1000);
+  await w.call('POST', `/api/v1/admin/posts/${post.id}/moderate`, {
+    token: TOKENS.owner, body: { action: 'redact', reason: 'test', expected_revision: 1 },
+  });
+  const reasons = (await w.bridge.status()).attention.filter((a) => a.id === id).map((a) => a.reason).sort();
+  assert.deepEqual(reasons, ['delivered_before_redaction', 'unresolved_redacted_write']);
+});

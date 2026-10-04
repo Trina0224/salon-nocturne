@@ -676,7 +676,12 @@ export class DriveBridge {
       // Any earlier attempt may have written the file: look before writing again.
       if (claimNo > 1 || d.state === 'uncertain') {
         const found = await client.findByAppProperty(folder, 'salonDelivery', id);
-        if (found) return this.endDelivery(id, claimNo, 'delivered', null, found.id);
+        if (found) {
+          // A recovered copy needs the same safety log as an acknowledged create.
+          await this.db.run(`INSERT OR IGNORE INTO drive_delivery_writes (delivery_id, remote_file_id, attempt, created_at) VALUES (?, ?, ?, ?)`,
+            id, found.id, claimNo, this.now());
+          return this.endDelivery(id, claimNo, 'delivered', null, found.id);
+        }
       }
       // Authoritative state again, after the lookup and right before the write.
       if ((await gate()) !== 'go') return false;
@@ -695,10 +700,35 @@ export class DriveBridge {
         threadTitle: thread.title, replyTo: post.replyToPostId, postedAt: post.createdAt, body: post.body,
       });
       if (post.publicationState !== 'published') return this.endDelivery(id, claimNo, 'skipped', 'post_removed');
+      // Persist uncertainty BEFORE calling Drive: a crash or lost response may
+      // leave a copy even if a newer claim has already skipped this delivery.
+      // Use a unique operation ID; claim numbers can be reused after requeue.
+      const operation = `write_${base64url(randomBytes(12))}`;
+      await this.db.run(`INSERT INTO drive_unresolved_writes (id, delivery_id, started_at) VALUES (?, ?, ?)`, operation, id, this.now());
+      // Saving the marker adds an await; recheck moderation/access afterward.
+      if ((await gate()) !== 'go') {
+        await this.db.run('DELETE FROM drive_unresolved_writes WHERE id = ?', operation);
+        return false;
+      }
+      const finalMapping = await this.recipient(recipientId);
+      if (String(finalMapping.inbox_folder_id) !== folder || String(finalMapping.account_id) !== accountId) {
+        await this.db.run('DELETE FROM drive_unresolved_writes WHERE id = ?', operation);
+        await this.db.run(`UPDATE drive_deliveries SET attempts = attempts - 1, state = 'uncertain', next_attempt_at = ? WHERE id = ? AND attempts = ?`,
+          this.now(), id, claimNo);
+        return false;
+      }
+      const finalPost = await loadPost(this.db, post.id);
+      if (finalPost?.publicationState !== 'published') {
+        await this.db.run('DELETE FROM drive_unresolved_writes WHERE id = ?', operation);
+        return this.endDelivery(id, claimNo, 'skipped', 'post_removed');
+      }
       const created = await client.createTextFile(folder, `salon-${post.id}.txt`, content, { salonBridge: '1', salonDelivery: id });
       // Every created file is logged, even by a worker that lost its claim, so duplicates are visible.
-      await this.db.run(`INSERT OR IGNORE INTO drive_delivery_writes (delivery_id, remote_file_id, attempt, created_at) VALUES (?, ?, ?, ?)`,
-        id, created.id, claimNo, this.now());
+      await this.db.batch([
+        stmt(`INSERT OR IGNORE INTO drive_delivery_writes (delivery_id, remote_file_id, attempt, created_at) VALUES (?, ?, ?, ?)`,
+          id, created.id, claimNo, this.now()),
+        stmt('DELETE FROM drive_unresolved_writes WHERE id = ?', operation),
+      ]);
       // If the post was redacted while the create ran, the write log and owner status report it.
       const after = await loadPost(this.db, post.id);
       const note = after?.publicationState === 'published' ? null : 'redacted_after_write';
@@ -775,6 +805,11 @@ export class DriveBridge {
            FROM drive_delivery_writes w JOIN drive_deliveries d ON d.id = w.delivery_id JOIN posts p ON p.id = d.post_id
              LEFT JOIN (SELECT target_id, MIN(at) AS at FROM audit_log WHERE action = 'redact_post' AND target_type = 'post' GROUP BY target_id) r ON r.target_id = p.id
            WHERE p.publication_state = 'redacted'
+           UNION ALL
+           SELECT d.id, d.post_id, d.recipient_id, 'unresolved_redacted_write', 0, MIN(u.started_at)
+           FROM drive_unresolved_writes u JOIN drive_deliveries d ON d.id = u.delivery_id JOIN posts p ON p.id = d.post_id
+           WHERE p.publication_state = 'redacted'
+           GROUP BY d.id, d.post_id, d.recipient_id
          ) ORDER BY at, id LIMIT 50`),
     };
   }
