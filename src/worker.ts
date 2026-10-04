@@ -40,13 +40,16 @@ function misconfigured(): Response {
 }
 
 /** The Salon for this environment, or null (logged) when the configuration is rejected. */
-function salonFor(env: WorkerEnv): Salon | null {
+function salonFor(env: WorkerEnv, scheduled = false): Salon | null {
   const result = workerConfig(env);
   if (!result.ok) {
     // Fail closed. The problems name settings, never their values.
     console.error(`Configuration rejected: ${result.problems.join(' ')}`);
     return null;
   }
+  // Validate first, then freeze scheduled work before any bridge setup or I/O.
+  // HTTP still constructs the app so its existing maintenance response applies.
+  if (scheduled && result.config.maintenance) return null;
   if (cached && cached.env === env) return cached.salon;
   const driveCfg = result.config.drive ?? null;
   let drive: Parameters<typeof createSalon>[0]['drive'];
@@ -80,7 +83,7 @@ export default {
 
   /** Cron-triggered catch-up for the Drive bridge; a no-op when the bridge is not configured. */
   async scheduled(_controller: unknown, env: WorkerEnv, ctx: ExecutionContextLike): Promise<void> {
-    const salon = salonFor(env);
+    const salon = salonFor(env, true);
     if (!salon?.drive) return;
     const drive = salon.drive;
     ctx.waitUntil(drive.runOnce().catch((err: unknown) => {

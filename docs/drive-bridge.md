@@ -173,9 +173,11 @@ Outbox files are never deleted, moved, or rewritten. The owner's Muse and Spark 
   - 403 rate limits and 429 are `rate_limited`. A file-level 403 (for example `insufficientFilePermissions`, `appNotAuthorizedToFile`; the full reason list is *assumed*) refuses that file only: an outbox file ends as `rejected: drive_file_forbidden`, and an inbox write fails visibly. An unknown 403 is treated as permanent, never as revoked access.
   - 404 is `not_found`; 5xx and network failures are retryable.
   - **Unknown outcome.** A create with an unknown outcome (timeout, network failure, 5xx, or a success response without a file ID) is reported as retryable, never as a definite failure. The delivery stays uncertain, its body-less marker stays, and the next attempt searches before writing.
+- **Delivery lookup** follows empty pages using `nextPageToken`, for at most five pages. Only a complete search proves absence. Incomplete searches, malformed continuation fields, repeated tokens, and an exhausted page budget produce retryable errors, keeping delivery uncertain without creating a new file.
 - **Worker execution** (`src/worker.ts`):
-  - `POST /drive/notifications` validates as above. A valid change starts one bounded run for that account after the response (`waitUntil`): its changes, then due files, fan-out, and deliveries.
+  - `POST /drive/notifications` validates as above. A valid change starts one bounded run for that account after the response (`waitUntil`): configuration reconciliation, its changes, then due files, fan-out, and deliveries. Removed mappings and changed inboxes apply before this work, including pending deliveries.
   - The `scheduled` handler runs the full bounded pass: configuration sync, channel renewal, every account, files, fan-out, deliveries.
+  - Both dispatch paths respect maintenance. Scheduled execution checks the validated maintenance setting before bridge initialization, Google calls, configuration writes, or channel renewal.
   - There is no endpoint that starts a run on request. Leases, claims, page checkpoints, and recovery state carry over interrupted runs.
 
 ## Authorization: what a future grant must cover (not decided)

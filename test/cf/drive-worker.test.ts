@@ -136,3 +136,75 @@ test('Worker bundle in workerd: Drive settings are accepted only complete, and t
     await partial.stop();
   }
 });
+
+/** Each regression uses real D1 with the actual Worker entrypoints and synthetic HTTP only. */
+async function regressionWorld() {
+  const dir = migratedState();
+  const proxy = await getPlatformProxy<{ DB: { prepare(sql: string): { all(): Promise<{ results: Record<string, unknown>[] }>; run(): Promise<unknown> } } }>({ configPath: WRANGLER_CONFIG, persist: { path: join(dir, 'v3') }, envFiles: [] });
+  const mock = new MockDrive([A, B]);
+  const google = new FakeGoogle(mock);
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => google.fetch(String(input instanceof Request ? input.url : input), init)) as typeof fetch;
+  const env: WorkerEnv = { DB: proxy.env.DB, REQUEST_LIMITER: limiter, PARTICIPANT_LIMITER: limiter, OWNER_TOKEN_SHA256: OWNER_HASH, TOKEN_PEPPER: PEPPER, ...DRIVE_VARS };
+  const scheduled = async (e = env) => { const ctx = context(); await worker.scheduled({}, e, ctx); await ctx.settle(); };
+  const rows = async (sql: string) => (await proxy.env.DB.prepare(sql).all()).results;
+  const close = async () => { globalThis.fetch = realFetch; await proxy.dispose(); rmSync(dir, { recursive: true, force: true }); };
+  try {
+    const opened = await worker.fetch(new Request('https://salon.test/api/v1/admin/sessions', {
+      method: 'POST', headers: { Authorization: `Bearer ${OWNER_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'Synthetic regression', duration_minutes: 60, limits: { maxPosts: 50, maxPostsPerParticipant: 20, maxThreads: 10, maxBodyChars: 500 } }),
+    }), env, context());
+    assert.equal(opened.status, 201, await opened.text());
+    await scheduled();
+    return { env, mock, google, scheduled, rows, db: proxy.env.DB, close };
+  } catch (err) { await close(); throw err; }
+}
+
+test('Worker scheduled maintenance freeze prevents all Google calls and database changes for queued work', async () => {
+  const w = await regressionWorld();
+  try {
+    w.mock.addFile(A, 'out-grok', { content: 'salon-message: 1\nid: frozen-grok\ntitle: Freeze\n---\nMust wait.\n' });
+    const tables = (await w.rows("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%'")).map((r) => String(r.name));
+    const snapshot = async () => Promise.all(tables.map((t) => w.rows(`SELECT * FROM "${t}"`)));
+    const before = await snapshot();
+    const calls = w.google.calls.length;
+    const frozen = { ...w.env, SALON_MAINTENANCE: 'on' };
+    assert.equal((await worker.fetch(new Request('https://salon.test/api/v1/sessions/current'), frozen, context())).status, 503);
+    await w.scheduled(frozen);
+    assert.equal(w.google.calls.length, calls, 'no token refresh, config initialization, channel renewal, reads or writes');
+    assert.deepEqual(await snapshot(), before, 'all database rows remain unchanged');
+    for (const inbox of ['in-grok', 'in-muse', 'in-rei']) assert.equal(w.mock.filesIn(inbox).length, 0);
+    await w.scheduled({ ...w.env, SALON_MAINTENANCE: 'off' });
+    assert.equal((await w.rows('SELECT * FROM posts')).length, 1);
+    assert.equal(w.mock.filesIn('in-rei').length, 1);
+  } finally { await w.close(); }
+});
+
+test('Worker webhook reconciles removed mappings and changed inboxes before cron, including pending deliveries', async () => {
+  const w = await regressionWorld();
+  try {
+    // Leave existing fan-out pending for both account B recipients.
+    w.mock.fail('createTextFile', 'rate_limited', { account: B, times: 2 });
+    w.mock.addFile(A, 'out-grok', { content: 'salon-message: 1\nid: before-remap\ntitle: Pending\n---\nPending before settings change.\n' });
+    await w.scheduled();
+    assert.equal((await w.rows("SELECT * FROM drive_deliveries WHERE state = 'uncertain'")).length, 2);
+    await w.db.prepare("UPDATE drive_deliveries SET next_attempt_at = '2000-01-01T00:00:00.000Z', claimed_until = NULL").run();
+    const updated = { ...BRIDGE, participants: BRIDGE.participants.filter((p) => p.name !== 'Muse').map((p) => p.name === 'Rei' ? { ...p, inbox: 'in-rei-new' } : p) };
+    const env = { ...w.env, DRIVE_BRIDGE_CONFIG: JSON.stringify(updated) };
+    w.mock.addFile(B, 'out-muse', { content: 'salon-message: 1\nid: removed-muse\ntitle: Removed\n---\nMust not import.\n' });
+    w.mock.addFile(B, 'out-rei', { content: 'salon-message: 1\nid: current-rei\ntitle: Current\n---\nCurrent mapping imports.\n' });
+    const [id, ch] = [...w.mock.channels.entries()].find(([, c]) => c.account === B)!;
+    const ctx = context();
+    const response = await worker.fetch(new Request('https://salon.test/drive/notifications', { method: 'POST', headers: {
+      'X-Goog-Channel-ID': id, 'X-Goog-Channel-Token': ch.token, 'X-Goog-Resource-ID': ch.resourceId, 'X-Goog-Resource-State': 'change',
+    } }), env, ctx);
+    assert.equal(response.status, 200);
+    await ctx.settle();
+    assert.deepEqual((await w.rows('SELECT body FROM posts ORDER BY seq')).map((r) => r.body), ['Pending before settings change.', 'Current mapping imports.']);
+    assert.equal((await w.rows("SELECT enabled FROM drive_participants WHERE outbox_folder_id = 'out-muse'"))[0]!.enabled, 0);
+    assert.equal(w.mock.filesIn('in-muse').length, 0, 'removed mapping receives neither pending nor new fan-out');
+    assert.equal(w.mock.filesIn('in-rei').length, 0, 'old inbox receives no pending delivery');
+    assert.equal(w.mock.filesIn('in-rei-new').length, 1, 'pending delivery follows current inbox');
+    assert.equal(w.mock.filesIn('in-grok').length, 1, 'current mapping still imports and fans out across accounts');
+  } finally { await w.close(); }
+});

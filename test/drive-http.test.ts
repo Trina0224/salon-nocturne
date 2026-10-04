@@ -349,3 +349,60 @@ test('Drive HTTP: channels use the expiration Drive grants; notifications wake, 
   const r2 = await direct('changed');
   assert.equal(r2.woke, true);
 });
+
+test('Drive HTTP: app-property lookup follows empty pages and only a complete search proves absence', async () => {
+  const r = recorder([ok({ files: [], nextPageToken: 'page-2' }), ok({ files: [{ id: 'existing' }] })]);
+  const c = new DriveHttpClient({ accountId: A, tokens: fixed(), fetch: r.fetch });
+  assert.deepEqual(await c.findByAppProperty('in', 'salonDelivery', 'd'), { id: 'existing' });
+  assert.equal(r.seen[1]!.url.searchParams.get('pageToken'), 'page-2');
+  assert.equal(r.seen[0]!.url.searchParams.get('fields'), 'nextPageToken,incompleteSearch,files(id)');
+  const empty = recorder([ok({ files: [], nextPageToken: 'last' }), ok({ files: [], incompleteSearch: false })]);
+  assert.equal(await new DriveHttpClient({ accountId: A, tokens: fixed(), fetch: empty.fetch }).findByAppProperty('in', 'k', 'v'), null);
+});
+
+test('Drive HTTP: incomplete, malformed, cyclic and over-budget searches are retryable, never misses', async () => {
+  const cases = [
+    [ok({ files: [], incompleteSearch: true })],
+    [ok({ files: [], incompleteSearch: 'false' })],
+    [ok({ files: [], nextPageToken: 42 })],
+    [ok({ files: [], nextPageToken: '' })],
+    [ok({ files: [{}] })],
+    [ok({ files: [], nextPageToken: 'same' }), ok({ files: [], nextPageToken: 'same' })],
+    Array.from({ length: 5 }, (_, i) => ok({ files: [], nextPageToken: `page-${i}` })),
+  ];
+  for (const answers of cases) {
+    const r = recorder(answers);
+    const c = new DriveHttpClient({ accountId: A, tokens: fixed(), fetch: r.fetch });
+    assert.match(await kindOf(c.findByAppProperty('in', 'k', 'v')), /^transient:/);
+    assert.ok(r.seen.length <= 5, 'search has a finite page budget');
+  }
+});
+
+test('Drive HTTP end to end: paginated lost-ack recovery and incomplete searches never duplicate a write', async () => {
+  for (const mode of ['paginated', 'incomplete', 'budget'] as const) {
+    const w = await httpWorld();
+    w.mock.fail('createTextFile', 'timeout_after_write', { account: B, times: 1 });
+    w.write('Spark', msg(`lost-${mode}`, 'title: Lost response', 'One copy only.'));
+    await w.bridge.runOnce();
+    const uncertain = w.raw.prepare("SELECT id FROM drive_deliveries WHERE state = 'uncertain'").get() as Json;
+    assert.ok(uncertain);
+    const copies = [...w.mock.filesIn('in-rei'), ...w.mock.filesIn('in-claude'), ...w.mock.filesIn('in-muse')];
+    const existing = copies.find((f) => f.meta.appProperties?.salonDelivery === uncertain.id)!;
+    assert.ok(existing);
+    const match = (c: { query: URLSearchParams }) => (c.query.get('q') ?? '').includes(String(uncertain.id));
+    if (mode === 'paginated') {
+      w.google.overrides.push({ match, respond: () => ok({ files: [], nextPageToken: 'page-2' }) },
+        { match: (c) => match(c) && c.query.get('pageToken') === 'page-2', respond: () => ok({ files: [{ id: existing.meta.id }] }) });
+    } else if (mode === 'incomplete') {
+      w.google.overrides.push({ match, respond: () => ok({ files: [], incompleteSearch: true }) });
+    } else {
+      for (let i = 0; i < 5; i++) w.google.overrides.push({ match, respond: () => ok({ files: [], nextPageToken: `next-${i}` }) });
+    }
+    const createsBefore = w.google.calls.filter((c) => c.path === '/upload/drive/v3/files').length;
+    w.clock.advance(LIMITS.maxBackoffMs + 1);
+    await w.bridge.runOnce();
+    assert.equal(w.google.calls.filter((c) => c.path === '/upload/drive/v3/files').length, createsBefore, mode);
+    assert.equal((w.raw.prepare('SELECT state FROM drive_deliveries WHERE id = ?').get(uncertain.id) as Json).state,
+      mode === 'paginated' ? 'delivered' : 'uncertain');
+  }
+});

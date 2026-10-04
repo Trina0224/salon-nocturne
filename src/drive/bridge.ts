@@ -788,11 +788,12 @@ export class DriveBridge {
   /**
    * The bounded run started by a valid change notification: this account's
    * changes (again, up to `wakeRounds` times, if notifications arrived during
-   * the run), then due files, fan-out, and deliveries. Channel renewal and
-   * configuration sync are left to the scheduled run.
+   * the run), then due files, fan-out, and deliveries. Both entrypoints first
+   * reconcile authoritative mappings; only channel renewal is left to cron.
    */
   async runAfterWake(accountId: string, workerId = `w_${base64url(randomBytes(6))}`): Promise<void> {
     if (!this.config.accounts.some((a) => a.id === accountId)) return;
+    await this.syncConfig();
     for (let round = 0; round < LIMITS.wakeRounds; round++) {
       const r = await this.runAccount(accountId, workerId);
       if (!r.ran) break; // another worker holds the account; it will see the changes

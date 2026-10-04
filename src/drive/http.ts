@@ -27,6 +27,8 @@ export const DRIVE_UPLOAD = 'https://www.googleapis.com/upload/drive/v3';
 /** The file fields the bridge uses; nothing more is requested. */
 const FILE_FIELDS = 'id,name,mimeType,parents,size,trashed,appProperties,createdTime,modifiedTime';
 const JSON_CAP = 1024 * 1024;
+/** A deduplication search must finish within this budget or remain uncertain. */
+const APP_PROPERTY_SEARCH_PAGES = 5;
 
 /** Rate-limit reasons on 403 (Drive also uses 429). */
 const RATE_REASONS = new Set(['rateLimitExceeded', 'userRateLimitExceeded', 'sharingRateLimitExceeded', 'dailyLimitExceeded']);
@@ -208,13 +210,28 @@ export class DriveHttpClient implements DriveClient {
   }
 
   async findByAppProperty(folderId: string, key: string, value: string): Promise<{ id: string } | null> {
-    const j = await this.json(await this.send(this.url(DRIVE_API, '/files', {
-      q: `appProperties has { key=${queryLiteral(key)} and value=${queryLiteral(value)} } and ${queryLiteral(folderId)} in parents and trashed = false`,
-      pageSize: '10', spaces: 'drive', fields: 'files(id)',
-    }), { method: 'GET' }));
-    if (!Array.isArray(j.files)) throw new DriveError('transient', 'malformed_response');
-    const first = j.files.find((f: Record<string, unknown>) => typeof f?.id === 'string' && f.id);
-    return first ? { id: String(first.id) } : null;
+    let pageToken: string | undefined;
+    const seen = new Set<string>();
+    for (let page = 0; page < APP_PROPERTY_SEARCH_PAGES; page++) {
+      const j = await this.json(await this.send(this.url(DRIVE_API, '/files', {
+        q: `appProperties has { key=${queryLiteral(key)} and value=${queryLiteral(value)} } and ${queryLiteral(folderId)} in parents and trashed = false`,
+        pageSize: '10', pageToken, spaces: 'drive', fields: 'nextPageToken,incompleteSearch,files(id)',
+      }), { method: 'GET' }));
+      if (!Array.isArray(j.files)
+        || j.files.some((f) => !f || typeof f.id !== 'string' || !f.id)
+        || (j.incompleteSearch !== undefined && typeof j.incompleteSearch !== 'boolean')
+        || (j.nextPageToken !== undefined && (typeof j.nextPageToken !== 'string' || !j.nextPageToken))) {
+        throw new DriveError('transient', 'malformed_response');
+      }
+      // A positive match suffices, but an incomplete/partial search never proves absence.
+      if (j.files.length) return { id: j.files[0].id };
+      if (j.incompleteSearch === true) throw new DriveError('transient', 'incomplete_search');
+      if (j.nextPageToken === undefined) return null;
+      pageToken = j.nextPageToken as string;
+      if (seen.has(pageToken)) throw new DriveError('transient', 'incomplete_search');
+      seen.add(pageToken);
+    }
+    throw new DriveError('transient', 'incomplete_search');
   }
 
   async watchChanges(pageToken: string, channel: { id: string; token: string; address: string; expiration: number }): Promise<{ resourceId: string; expiration: number }> {
