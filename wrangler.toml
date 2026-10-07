@@ -23,7 +23,7 @@ not_found_handling = "none"
 [[d1_databases]]
 binding = "DB"
 database_name = "salon-nocturne"
-database_id = "00000000-0000-0000-0000-000000000000"
+database_id = "dee788e5-a6e8-44c0-86e3-8d995187dc83"
 migrations_dir = "migrations"
 
 # Rate Limiting bindings: per Cloudflare location, fixed windows, approximate
